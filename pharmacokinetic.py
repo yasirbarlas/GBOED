@@ -29,7 +29,7 @@ from pyro import poutine
 from pyro.infer.autoguide import AutoDiagonalNormal
 
 from gibbs_eig import gibbs_nmc_eig
-from loss_functions import score_matching_location
+from loss_functions import score_matching_pharmacokinetic
 
 # Get device for PyTorch (GPU or CPU for training)
 #device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -63,7 +63,7 @@ def iqr(tensor, dim=None, keepdim=False):
     q25 = torch.quantile(tensor, 0.25, dim=dim, keepdim=keepdim, interpolation="midpoint")
     return q75 - q25
 
-def get_c_exponential_decay(i, rate=0.3, q1=9, q2=1):
+def get_c_exponential_decay(i, rate=0.3, q1=0.8, q2=0.2):
     return q1 * np.exp(-rate * i) + q2
     
 def compute_predictive_distribution(model, xi, num_samples=1000):
@@ -251,59 +251,60 @@ def compute_mean_log_likelihood(true_values, model, xi, num_theta_samples=100):
 # TODO read from torch float spec
 epsilon = torch.tensor(2**-22)
 
-def make_location_model(theta_mu, theta_sig, alpha, b, m, observation_sd, observation_label="y"):
-    def location_model(design):
+def make_pharmaco_model(theta_loc, theta_covmat, D_v, epsilon_scale, nu_scale, observation_label="y"):
+    def pharmaco_model(design):
         if is_bad(design):
             raise ArithmeticError("bad design, contains nan or inf")
         batch_shape = design.shape[:-2]
         with ExitStack() as stack:
             for plate in iter_plates_to_shape(batch_shape):
                 stack.enter_context(plate)
-            theta_shape = batch_shape + theta_mu.shape[-2:]
-            theta = pyro.sample("theta", dist.Normal(theta_mu.expand(theta_shape), theta_sig.expand(theta_shape)).to_event(2))
-            #print("theta", theta, theta.shape)
-            #print("design", design, design.shape)
-            distance = torch.square(theta - design).sum(dim=-1)
-            #print("distance", distance.shape, distance)
-            ratio = alpha / (m + distance)
-            mu = b + ratio.sum(dim=-1, keepdims=True)
-            #print("mu", mu.shape, mu)
-            emission_dist = dist.Normal(torch.log(mu), observation_sd).to_event(1)
+            theta = pyro.sample("log_theta", dist.MultivariateNormal(theta_loc, theta_covmat)).exp()
+            # unpack latents [these are exp-ed already!]
+            k_a, k_e, V = [theta[..., [i]] for i in range(3)]
+            assert (k_a > k_e).all()
+            # compute concentration at time t=xi
+            # shape of mean is [batch, n] where n is number of obs per design
+            mean = ((D_v / V) * (k_a / (k_a - k_e)) * (
+                    torch.exp(-torch.einsum("...ijk, ...ik->...ij", design, k_e))
+                    - torch.exp(-torch.einsum("...ijk, ...ik->...ij", design, k_a))))
+            sd = torch.sqrt((mean * epsilon_scale) ** 2 + nu_scale ** 2)
+            emission_dist = dist.Normal(mean, sd).to_event(1)
+            #print("emission_dist", emission_dist.shape)
             y = pyro.sample(observation_label, emission_dist)
+            #print("y", y.shape)
             return y
 
-    return location_model
+    return pharmaco_model
 
-def elboguide(design, dim=1, k=2, d=2):
-    theta_mu = pyro.param("theta_mu", torch.zeros(dim, 1, k, d))
-    theta_sig = pyro.param("theta_sig", torch.ones(dim, 1, k, d), constraint=torch.distributions.constraints.positive)
+def elboguide(design, dim=3):
+    theta_mu = pyro.param("theta_mu", torch.tensor([1, 0.1, 20]).log(), constraint=torch.distributions.constraints.real)
+    theta_sig = pyro.param("theta_sig", torch.eye(dim) * 0.05, constraint=torch.distributions.constraints.positive)
     batch_shape = design.shape[:-2]
     with ExitStack() as stack:
         for plate in iter_plates_to_shape(batch_shape):
             stack.enter_context(plate)
-        theta_shape = batch_shape + theta_mu.shape[-2:]
-        pyro.sample("theta", dist.Normal(theta_mu.expand(theta_shape), theta_sig.expand(theta_shape)).to_event(2))
+        pyro.sample("log_theta", dist.MultivariateNormal(theta_mu, theta_sig))
 
-def main(num_steps, num_parallel, experiment_name, typs, inference, seed, lengthscale, variance, num_acquisition, obs_sd, w, N, M, chosen_loss, misspecification, actual_observation_sd, c_imq, b_use_expdecay, b_expdecay_imq, k, d, loglevel):
+def main(num_steps, num_parallel, experiment_name, typs, inference, seed, lengthscale, variance, num_acquisition, assumed_epsilon_scale, assumed_nu_scale, w, N, M, chosen_loss, misspecification, actual_epsilon_scale, actual_nu_scale, c_imq, b_use_expdecay, b_expdecay_imq, loglevel):
     numeric_level = getattr(logging, loglevel.upper(), None)
     if not isinstance(numeric_level, int):
         raise ValueError("Invalid log level: {}".format(loglevel))
     logging.basicConfig(level=numeric_level)
 
-    output_dir = "./location/"
+    output_dir = "./pharmacokinetic/"
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-    #if not experiment_name:
-    experiment_name = output_dir+f"seed{seed}:{datetime.datetime.now().isoformat()}"
-    #else:
-    #    experiment_name = output_dir+experiment_name
+    if not experiment_name:
+        experiment_name = output_dir+f"seed{seed}:{datetime.datetime.now().isoformat()}"
+    else:
+        experiment_name = output_dir+experiment_name
     results_file = experiment_name + '.result_stream.pickle'
     try:
         os.remove(results_file)
     except OSError:
         logging.info("File {} does not exist yet".format(results_file))
     typs = typs.split(",")
-    observation_sd = torch.tensor(obs_sd)
 
     for typ in typs:
         logging.info("Type {}".format(typ))
@@ -315,27 +316,27 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
         #torch.backends.cudnn.deterministic = True
         #torch.backends.cudnn.benchmark = False
 
-        #k, d = 2, 2
-        num_bo_steps = 9
-        design_dim = d
+        num_bo_steps = 5
+        design_dim = 1
 
-        alpha = 1
-        b = 0.1
-        m = 0.0001
+        D_v = 400.0
+        assumed_epsilon = np.sqrt(assumed_epsilon_scale)
+        assumed_nu = np.sqrt(assumed_nu_scale)
+        actual_epsilon = np.sqrt(actual_epsilon_scale)
+        actual_nu = np.sqrt(actual_nu_scale)
+
+        #prior = make_pharmaco_model(torch.zeros(num_parallel, 1, k, d), torch.zeros(num_parallel, 1, k, d), alpha, b, m, observation_sd)
+
+        theta_mu, theta_sig = torch.tensor([1, 0.1, 20]).log(), torch.eye(3) * 0.05
+
+        #prior = torch.distributions.MultivariateNormal(theta_mu, theta_sig)
+        #true_theta = prior.sample(torch.Size([1]))
+        true_theta = torch.tensor([[1.5, 0.15, 15.0]]).log()
         
-        #prior = make_location_model(torch.zeros(num_parallel, 1, k, d), torch.zeros(num_parallel, 1, k, d), alpha, b, m, observation_sd)
-
-        theta_mu, theta_sig = torch.zeros(num_parallel, 1, k, d), torch.ones(num_parallel, 1, k, d)
-
-        # Use only the first d numbers in each row for true_theta
-        full_true_theta = torch.tensor([[[[1.5, -1.3, 0.1, -1.8, -0.7, -1.1, 0.4, 0.4, -2.0, -1.2, -0.3, 0.2, 1.6, -1.2, 1.5, 0.8], 
-                         [-1.8, 0.5, 1.9, -0.2, -1.7, 1.4, -0.5, 2.0, -1.1, 1.2, 1.6, -2.0, -0.1, 0.0, -1.6, -1.3]]]])
-        true_theta = full_true_theta[..., :d]
-
-        print("true_theta", true_theta)
+        print("True log theta", true_theta)
 
         # Define the true model based on the type of misspecification
-        true_model = pyro.condition(make_location_model(theta_mu, theta_sig, alpha, b, m, observation_sd), {"theta": true_theta})
+        true_model = pyro.condition(make_pharmaco_model(theta_mu, theta_sig, D_v, assumed_epsilon, assumed_nu), {"log_theta": true_theta})
         if misspecification == "none":
             data_real_world = true_model
         elif misspecification == "outlier":
@@ -344,13 +345,13 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
                 #print("normal_val", normal_val)
                 outlier_mask = dist.Bernoulli(torch.tensor(0.3)).sample(normal_val.shape)
                 #print("outlier_mask", outlier_mask)
-                outlier = dist.Uniform(3 * observation_sd, 7 * observation_sd).sample(normal_val.shape)
+                outlier = dist.Uniform(-3.5, -1.5).sample(normal_val.shape)
                 #print("outlier", outlier)
                 normal_val += - (outlier_mask * outlier)
                 #print("modified normal_val", normal_val)
                 return normal_val
         elif misspecification == "error-dist":
-            true_model = pyro.condition(make_location_model(theta_mu, theta_sig, alpha, b, m, actual_observation_sd), {"theta": true_theta})
+            true_model = pyro.condition(make_pharmaco_model(theta_mu, theta_sig, D_v, actual_epsilon, actual_nu), {"log_theta": true_theta})
             data_real_world = true_model
         else:
             raise ValueError(f"Unknown misspecification type: {misspecification}. Choose from 'none', 'outlier', or 'error-dist'.")
@@ -359,7 +360,7 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
         ys = torch.tensor([])
         history = [(theta_mu.detach().clone().cpu().numpy(), theta_sig.detach().clone().cpu().numpy())]
 
-        model = make_location_model(theta_mu, theta_sig, alpha, b, m, observation_sd)
+        model = make_pharmaco_model(theta_mu, theta_sig, D_v, assumed_epsilon, assumed_nu)
 
         #eigs = []
         #losses = []
@@ -369,7 +370,7 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
         max_eigs = []
 
         # Loss function
-        dsm = score_matching_location(w=w, obs_sd=observation_sd, b=b, m=m, a=alpha)
+        dsm = score_matching_pharmacokinetic(w=w, D_v=D_v, epsilon_scale=assumed_epsilon, nu_scale=assumed_nu)
 
         # Use the desired loss function
         if chosen_loss == "score-matching-weighted":
@@ -378,8 +379,8 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
             gen_loss_fn = dsm.dm_normal
         elif chosen_loss == "neg-log":
             gen_loss_fn = dsm.negative_log_likelihood
-        else:
-            raise ValueError(f"Unknown loss function: {chosen_loss}. Choose from 'score-matching-weighted', 'score-matching-default', or 'neg-log'.")
+        #else:
+        #    raise ValueError(f"Unknown loss function: {chosen_loss}. Choose from 'score-matching-weighted', 'score-matching-default', or 'neg-log'.")
 
         # Generalised ELBO function for SVI
         def generalised_elbo(model, guide, *args, **kwargs):
@@ -435,7 +436,7 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
         for experiment in range(num_steps):
             logging.info("Experiment {}".format(experiment + 1))
             results = {'typ': typ, 'step': experiment + 1, 'seed': seed, 'variance': variance,
-                       'lengthscale': lengthscale, 'observation_sd': observation_sd, 'num_acquisition': num_acquisition}
+                       'lengthscale': lengthscale, 'num_acquisition': num_acquisition}
 
             # Design phase
             t = time.time()
@@ -451,12 +452,12 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
                 if b_expdecay_imq <= 0:
                     c_squared = None
                 else:
-                    c_squared = get_c_exponential_decay(experiment, rate=b_expdecay_imq, q1=9, q2=1) ** 2
-            
+                    c_squared = get_c_exponential_decay(experiment, rate=b_expdecay_imq, q1=0.8, q2=0.2) ** 2
+
             # Initialisation
             noise = torch.tensor(0.2).pow(2)
             # X = 100*rexpand(torch.rand((num_parallel, num_acq)), 4)
-            X = -4 + 8 * torch.rand((num_parallel, num_acquisition, 1, design_dim))
+            X = 24 * torch.rand((num_parallel, num_acquisition, 1, design_dim))
             # Ensures designs are the same (assuming seed is the same) no matter the loss function used for computing metrics (fairer comparison of results)
             predictive_samples = compute_predictive_distribution(model, X, num_samples=1000).squeeze(-1).squeeze(-2).unsqueeze(-1)
             true_values = true_model(lexpand(X, predictive_samples.shape[0])).squeeze(-1).squeeze(-2).unsqueeze(-1)
@@ -480,47 +481,20 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
             results['rmse'], results['mmd'], results['log_likelihood'] = rmse_predictive, mmd_predictive, log_likelihood_predictive
 
             if typ in ['nmc', 'gibbs-nmc']:
-                # Initialisation
-                #noise = torch.tensor(0.2).pow(2)
-                # X = 100*rexpand(torch.rand((num_parallel, num_acq)), 4)
-                #X = -4 + 8 * torch.rand((num_parallel, num_acquisition, 1, design_dim))
-                
-                # Ensures designs are the same (assuming seed is the same) no matter the loss function used for computing metrics (fairer comparison of results)
-                #predictive_samples = compute_predictive_distribution(model, X, num_samples=1000).squeeze(-1).squeeze(-2).unsqueeze(-1)
-                #true_values = true_model(lexpand(X, predictive_samples.shape[0])).squeeze(-1).squeeze(-2).unsqueeze(-1)
-                #print(predictive_samples.shape, true_values.shape)
-
-                #rmse_predictive = compute_rmse_predictive_vs_true(predictive_samples, true_values)
-                #rmses.append(rmse_predictive)
-                #print(f"RMSE between predictive distribution and true model: {rmse_predictive}")
-
-                #mmd_predictive = compute_mmd_vectorized_per_dim(predictive_samples, true_values, bandwidths=median_heuristic_bandwidth_per_dim(predictive_samples, true_values))
-                #mmds.append(mmd_predictive)
-                #print(f"MMD between predictive distribution and true model: {mmd_predictive}")
-
-                #log_likelihood_predictive = compute_mean_log_likelihood(true_values, model, X.squeeze(0), num_theta_samples=100)
-                #log_likelihoods.append(log_likelihood_predictive)
-                #print(f"Mean log-likelihood between predictive distribution and true model: {log_likelihood_predictive}")
-
-                #logging.info("RMSE {} \n MMD {} \n Log Likelihood {}".format(
-                #    rmse_predictive, mmd_predictive, log_likelihood_predictive))
-                
-                #results['rmse'], results['mmd'], results['log_likelihood'] = rmse_predictive, mmd_predictive, log_likelihood_predictive
-                
                 #print(X, X.shape)
                 #x_f = X
 
                 if typ == 'nmc':
                     def f(X):
                         return torch.cat([nmc_eig(model, X, ["y"],
-                                                  ["theta"], N=N, M=M)
+                                                  ["log_theta"], N=N, M=M)
                                         ], dim=1)
                     
                 elif typ == 'gibbs-nmc':
                     def f(X):
                         return torch.cat([gibbs_nmc_eig(model, X, 
                                                   lambda *args, **kwargs: gen_loss_fn(*args, model=model, predictive=predictive_samples, tau=tau, c_squared=c_squared, **kwargs), ["y"],
-                                                  ["theta"], N=N, M=M, w=w).unsqueeze(0)
+                                                  ["log_theta"], N=N, M=M, w=w).unsqueeze(0)
                                         ], dim=1)
 
                 y = f(X)
@@ -537,14 +511,14 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
                 kernel = gp.kernels.Matern52(input_dim=1, lengthscale=torch.tensor(lengthscale),
                                              variance=torch.tensor(variance)) # y.var(unbiased=True) torch.tensor(variance)
                 X = X.squeeze(-2).squeeze(0)
-                constraint = torch.distributions.constraints.interval(-4., 4.)
+                constraint = torch.distributions.constraints.interval(1e-6, 24.)
 
                 for i in range(num_bo_steps):
                     #print(f"bo step{i}")
                     Kff = kernel(X)
                     Kff += noise * torch.eye(Kff.shape[-1])
                     Lff = torch.linalg.cholesky(Kff) #Kff.cholesky(upper=False)
-                    Xinit = -4 + 8 * torch.rand((num_parallel, num_acquisition, design_dim))
+                    Xinit = 24 * torch.rand((num_parallel, num_acquisition, design_dim))
                     unconstrained_Xnew = transform_to(constraint).inv(Xinit).detach().clone().requires_grad_(True)
                     minimizer = torch.optim.LBFGS([unconstrained_Xnew], max_eval=20)
 
@@ -558,7 +532,7 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
                         mean = rmv(LiK.transpose(-1, -2), Liy.squeeze(-1))
                         KXnewXnew = kernel(Xnew)
                         var = (KXnewXnew - LiK.transpose(-1, -2).matmul(LiK)).diagonal(dim1=-2, dim2=-1)
-                        ucb = -(mean + 12*var.sqrt())
+                        ucb = -(mean + 6*var.sqrt())
                         loss = ucb.sum()
                         torch.autograd.backward(unconstrained_Xnew,
                                                 torch.autograd.grad(loss, unconstrained_Xnew, retain_graph=True))
@@ -585,7 +559,7 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
                 print('X_shape after BO', X.shape)
 
             elif typ == 'random':
-                d_star_design = -4 + 8 * torch.rand((num_parallel, 1, 1, design_dim))
+                d_star_design = 24 * torch.rand((num_parallel, 1, 1, design_dim))
 
             #print(X, X.shape)
             #print(y, y.shape)
@@ -646,7 +620,7 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
                 raise ValueError(f"Unknown inference type: {inference}. Choose from 'bayesian' or 'gibbs'.")
 
             conditioned_model = pyro.condition(model, {"y": ys})
-            guide = lambda *args, **kwargs: elboguide(*args, k=k, d=d, **kwargs) # AutoDiagonalNormal(conditioned_model) not functioning properly
+            guide = lambda *args, **kwargs: elboguide(*args, **kwargs) # AutoDiagonalNormal(conditioned_model) not functioning properly
             svi = SVI(conditioned_model,
                     guide,
                     Adam({"lr": 0.005}),
@@ -664,7 +638,7 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
             #     guide_loc.squeeze(), guide_scale.squeeze()))
             # results['guide_loc'], results['guide_scale'] = guide_loc, guide_scale
 
-            # model = make_location_model(guide_loc, guide_scale, alpha, b, m, observation_sd)
+            # model = make_pharmaco_model(theta_mu, theta_sig, D_v, epsilon_scale, nu_scale)
 
             # elbo_learn(
             #         prior, d_star_designs, ["y"], ["theta"], 10, 1000,
@@ -680,7 +654,7 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
 
             history.append((theta_mu.detach().clone().cpu().numpy(), theta_sig.detach().clone().cpu().numpy()))
 
-            model = make_location_model(theta_mu, theta_sig, alpha, b, m, observation_sd)
+            model = make_pharmaco_model(theta_mu, theta_sig, D_v, assumed_epsilon, assumed_nu)
 
             # predictive_samples = compute_predictive_distribution(model, X.unsqueeze(2).unsqueeze(0), num_samples=1000).squeeze(-1).squeeze(-2).unsqueeze(-1)
             # true_values = true_model(lexpand(X.unsqueeze(2).unsqueeze(0), predictive_samples.shape[0])).squeeze(-1).squeeze(-2).unsqueeze(-1)
@@ -704,7 +678,7 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
 
             # Final loop should output final results
             if (experiment + 1) == num_steps:
-                X = -4 + 8 * torch.rand((num_parallel, num_acquisition, 1, design_dim))
+                X = 24 * torch.rand((num_parallel, num_acquisition, 1, design_dim))
 
                 # Ensures designs are the same (assuming seed is the same) no matter the loss function used for computing metrics (fairer comparison of results)
                 predictive_samples = compute_predictive_distribution(model, X, num_samples=1000).squeeze(-1).squeeze(-2).unsqueeze(-1)
@@ -734,10 +708,10 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
             with open(results_file, 'ab') as f:
                 pickle.dump(results, f)
 
-        with open(f"_loc_find_results_{chosen_loss}_misspec_{misspecification}_N{N}_M{M}_assum_std{observation_sd}_w{round(w, 4)}_1.txt", "a") as file:
+        with open(f"_pharmaco_results_{chosen_loss}_misspec_{misspecification}_N{N}_M{M}_w{round(w, 4)}_1.txt", "a") as file:
             file.write(f"{seed};{rmses};{mmds};{log_likelihoods};{max_eigs};{final_elapsed}\n")
 
-        with open(f"_loc_find_results_{chosen_loss}_misspec_{misspecification}_N{N}_M{M}_assum_std{observation_sd}_w{round(w, 4)}_2.txt", "a") as file:
+        with open(f"_pharmaco_results_{chosen_loss}_misspec_{misspecification}_N{N}_M{M}_w{round(w, 4)}_2.txt", "a") as file:
             #eigs_list = [e.tolist() if hasattr(e, "tolist") else list(e) for e in eigs]
             #losses_list = [l.tolist() if hasattr(l, "tolist") else list(l) for l in losses]
             history_list = [(h[0].tolist() if hasattr(h[0], "tolist") else list(h[0]),
@@ -756,35 +730,35 @@ if __name__ == "__main__":
         else:
             raise argparse.ArgumentTypeError('Boolean value expected.')
 
-    parser = argparse.ArgumentParser(description="Location Finding"
+    parser = argparse.ArgumentParser(description="Pharmacokinetic"
                                                  " iterated experiment design")
     parser.add_argument("--seed", type=int, default=50, help="Random seed for reproducibility")
-    parser.add_argument("--T", type=int, default=1, help="Number of experiments to run")
+    parser.add_argument("--T", type=int, default=10, help="Number of experiments to run")
     #parser.add_argument("--num-parallel", nargs="?", default=1, type=int)
     parser.add_argument("--name", nargs="?", default="nmc", type=str)
-    parser.add_argument("--typs", nargs="?", default="random", type=str)
+    parser.add_argument("--typs", nargs="?", default="gibbs-nmc", type=str)
     parser.add_argument("--inference", nargs="?", default="gibbs", type=str)
-    parser.add_argument("--lengthscale", nargs="?", default=15.0, type=float)
-    parser.add_argument("--variance", nargs="?", default=4.0, type=float)
+    parser.add_argument("--lengthscale", nargs="?", default=20.0, type=float)
+    parser.add_argument("--variance", nargs="?", default=10.0, type=float)
     parser.add_argument("--loglevel", default="info", type=str)
     parser.add_argument("--num-acquisition", default=100, type=int)
-    parser.add_argument("--observation-sd", default=0.5, type=float)
+    parser.add_argument("--assumed-epsilon-scale", default=0.01, type=float)
+    parser.add_argument("--assumed-nu-scale", default=0.1, type=float)
     parser.add_argument("--w", default=1.0, type=float, help="Learning rate for posterior")
     parser.add_argument("--N", type=int, default=10000, help="Number of samples for EIG estimation (N)")
     parser.add_argument("--M", type=int, default=100, help="Number of samples for EIG estimation (M)")
-    parser.add_argument("--chosen-loss", default="score-matching-weighted", type=str,
+    parser.add_argument("--chosen-loss", default="neg-log", type=str,
                         help="Choose from 'score-matching-weighted' or 'score-matching-default'.")
     parser.add_argument("--misspecification", default="none", type=str,
                         help="Choose from 'none', 'outlier', or 'error-dist'.")
-    parser.add_argument("--actual-observation-sd", default=0.5, type=float)
+    parser.add_argument("--actual-epsilon-scale", default=0.01, type=float)
+    parser.add_argument("--actual-nu-scale", default=0.1, type=float)
     parser.add_argument("--c-imq", default=0.0, type=float,
                         help="Input '0.0' for adaptive predictive variance (Laplante)." \
                         "Smaller values of c downweight observations faster.")
-    parser.add_argument("--b-use-expdecay", type=str2bool, default=False, help="Whether to use exponential decay for c or not")
-    parser.add_argument("--b-expdecay-imq", default=0.0, type=float,
+    parser.add_argument("--b-use-expdecay", type=str2bool, default=True, help="Whether to use exponential decay for c or not")
+    parser.add_argument("--b-expdecay-imq", default=0.20, type=float,
                         help="Smaller values of b lead to slow decreases in c per experiment/timestep.")
-    parser.add_argument("--k", default=2, type=int, help="Number of objects K in environment")
-    parser.add_argument("--d", default=2, type=int, help="Number of dimensions D in environment")
     args = parser.parse_args()
     main(args.T, 1, args.name, args.typs, args.inference, args.seed, args.lengthscale, args.variance, args.num_acquisition,
-         args.observation_sd, args.w, args.N, args.M, args.chosen_loss, args.misspecification, args.actual_observation_sd, args.c_imq, args.b_use_expdecay, args.b_expdecay_imq, args.k, args.d, args.loglevel)
+         args.assumed_epsilon_scale, args.assumed_nu_scale, args.w, args.N, args.M, args.chosen_loss, args.misspecification, args.actual_epsilon_scale, args.actual_nu_scale, args.c_imq, args.b_use_expdecay, args.b_expdecay_imq, args.loglevel)
