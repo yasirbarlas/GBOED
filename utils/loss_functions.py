@@ -7,68 +7,6 @@ def iqr(tensor, dim=None, keepdim=False):
     q75 = torch.quantile(tensor, 0.75, dim=dim, keepdim=keepdim, interpolation="midpoint")
     q25 = torch.quantile(tensor, 0.25, dim=dim, keepdim=keepdim, interpolation="midpoint")
     return q75 - q25
-
-def negative_log_likelihood(xi, y, theta, sigma=2.0, predictive=None):
-    residuals = y - (theta[..., 0].unsqueeze(-1) + theta[..., 1].unsqueeze(-1) * xi)
-    nll = (1 / 2) * torch.log(torch.tensor([2 * torch.pi * sigma**2])) + (1 / (2 * sigma**2)) * (residuals**2)
-    return nll.squeeze()
-
-def log_likelihood(model, x, y, theta):
-    """
-    Computes log-likelihood for observed y given a Pyro model.
-    """
-    y = y.clone().detach().requires_grad_(True)
-    data_dict = theta
-    #data_dict.update(theta)
-    conditioned_model = pyro.condition(model, data=data_dict)
-    model_trace = poutine.trace(conditioned_model).get_trace(x.clone().detach().requires_grad_(True))
-    log_like = model_trace.nodes["y"]["fn"].log_prob(y).sum()
-    return log_like, y
-
-def derivatives_log_likelihood_wrt_y(model, x, y, theta):
-    """
-    Returns first and second derivatives of log-likelihood w.r.t. y.
-    """
-    log_like, y_var = log_likelihood(model, x, y, theta)
-    grad1 = torch.autograd.grad(log_like, y_var, create_graph=True)[0]
-    grad2 = torch.autograd.grad(grad1.sum(), y_var, retain_graph=True)[0]
-    return grad1, grad2
-
-def power_likelihood(xi, y, theta, sigma=0.5, c=1.0):
-    residuals = y - (theta[..., 0].unsqueeze(-1) + theta[..., 1].unsqueeze(-1) * xi)
-    log_likelihood = - (1 / 2) * torch.log(torch.tensor([2 * torch.pi * sigma**2])) - (1 / (2 * sigma**2)) * (residuals**2)
-    power_likelihood = torch.exp(c * log_likelihood)
-    return power_likelihood
-
-def gamma_divergence(xi, y, theta, sigma=2.0, gamma_d=1.01):
-    residuals = y - (theta[..., 0].unsqueeze(-1) + theta[..., 1].unsqueeze(-1) * xi)
-    log_prior_noise_factor = - (1 / 2) * torch.log(torch.tensor([2 * torch.pi * sigma**2]))
-    log_obs_factor = - (1 / (2 * sigma**2)) * (residuals**2)
-    #log_likelihood = - (1 / 2) * torch.log(torch.tensor([2 * torch.pi * sigma**2])) - (1 / (2 * sigma**2)) * (residuals**2)
-    sig_gamma = (2 * torch.pi * sigma**2) ** (- gamma_d * (1 / 2))
-    integral_term = (1.0 + gamma_d) ** (- 3 / 2) * sig_gamma
-    log_lkl = -(log_prior_noise_factor + (1.0 / gamma_d) * sig_gamma * torch.exp(gamma_d * log_obs_factor) / (integral_term ** (gamma_d / (1.0 + gamma_d))))
-    return log_lkl.squeeze()
-
-def beta_divergence_knoblauch(xi, y, theta, sigma=2.0, beta_d=1.01):
-    #log_likelihood = - (1 / 2) * torch.log(torch.tensor([2 * torch.pi * sigma**2])) - (1 / (2 * sigma**2)) * (residuals**2)
-    residuals = y - (theta[..., 0].unsqueeze(-1) + theta[..., 1].unsqueeze(-1) * xi)
-    log_prior_noise_factor = - (1 / 2) * torch.log(torch.tensor([2 * torch.pi * sigma**2]))
-    log_obs_factor = - (1 / 2) * (residuals)**2 / sigma**2
-    sig_beta = (2 * torch.pi * sigma**2) ** (- beta_d * (1 / 2))
-    integral_term = (1.0 + beta_d) ** (- 3 / 2) * sig_beta
-    log_lkl = (log_prior_noise_factor - integral_term + (1.0 / beta_d) * sig_beta * torch.exp(beta_d * log_obs_factor))
-    return log_lkl.squeeze()
-
-def gamma_divergence_knoblauch(xi, y, theta, sigma=2.0, gamma_d=1.01):
-    #log_likelihood = - (1 / 2) * torch.log(torch.tensor([2 * torch.pi * sigma**2])) - (1 / (2 * sigma**2)) * (residuals**2)
-    residuals = y - (theta[..., 0].unsqueeze(-1) + theta[..., 1].unsqueeze(-1) * xi)
-    log_prior_noise_factor = - (1 / 2) * torch.log(torch.tensor([2 * torch.pi * sigma**2]))
-    log_obs_factor = - (1 / 2) * (residuals)**2 / sigma**2
-    sig_gamma = (2 * torch.pi * sigma**2) ** (- gamma_d * (1 / 2))
-    integral_term = (1.0 + gamma_d) ** (- 3 / 2) * sig_gamma
-    log_lkl = (log_prior_noise_factor + (1.0 / gamma_d) * sig_gamma * torch.exp(gamma_d * log_obs_factor) / (integral_term ** (gamma_d / (1.0 + gamma_d))))
-    return torch.exp(log_lkl).squeeze()
     
 class score_matching_regression:
     def __init__(self, w, mean_vec, covariance_mat, std_y):
@@ -122,7 +60,7 @@ class score_matching_regression:
 
         return new_mean_vec, new_covariance_mat # returns the precision matrix, not the covariance matrix
     
-    def dm_final(self, x, y, theta, predictive=None, tau=None, c_squared=None):
+    def dm_normal(self, x, y, theta, predictive=None, tau=None, c_squared=None):
         if isinstance(y, dict):
             y = y["y"]
         if isinstance(theta, dict):
@@ -136,7 +74,7 @@ class score_matching_regression:
             theta = theta["beta"]
         return (((torch.sum(x * theta, dim=-1) - y.squeeze()) / (self.std_y ** 2)) ** 2) + (2 * (-1 / (self.std_y ** 2)))
     
-    def dm_final_weighted(self, x, y, theta, predictive, tau=1, c_squared=None):
+    def dm_weighted(self, x, y, theta, predictive, tau=1, c_squared=None):
         if isinstance(y, dict):
             y = y["y"]
         if isinstance(theta, dict):
@@ -149,9 +87,11 @@ class score_matching_regression:
             #c_squared = iqr(predictive, dim=0) ** 2
         
         imq_squared = (((self.w) * ((1 + tau * (((y - mean) ** 2) / c_squared)) ** (-1 / 2))) ** 2)
+        #print("imq_squared", imq_squared.shape)
         imq_squared_deriv = -(self.w ** 2) * ((1 + tau * (((y - mean) ** 2) / c_squared)) ** -2) * (2 * tau * (y - mean) / c_squared)
         #imq_squared_deriv = -(self.w ** 2) * ((1 + (((y - mean) ** 2) / c_squared)) ** -2) * (2 * (y - mean) / c_squared)
         model = (torch.sum(self.grad_r(x, y) * theta, dim=-1) - (y.squeeze() / (self.std_y ** 2)))
+        #print("model", model.shape)
         model_deriv = (-1 / (self.std_y ** 2))
         return imq_squared.squeeze() * (model ** 2) + 2 * (imq_squared.squeeze() * model_deriv + model * imq_squared_deriv.squeeze())
     
@@ -267,38 +207,102 @@ class score_matching_location:
         
         imq_squared = (((self.w) * ((1 + tau * (((y - mean) ** 2) / c_squared)) ** (-1 / 2))) ** 2)
         imq_squared_deriv = -(self.w ** 2) * ((1 + tau * (((y - mean) ** 2) / c_squared)) ** -2) * (2 * tau * (y - mean) / c_squared)
-        #imq_squared_deriv = -(self.w ** 2) * ((1 + (((y - mean) ** 2) / c_squared)) ** -2) * (2 * (y - mean) / c_squared)
+
         model = ((torch.log(mu) - y) / (self.obs_sd ** 2))
         model_deriv = (-1 / (self.obs_sd ** 2))
+        
         return (imq_squared * (model ** 2) + 2 * (imq_squared * model_deriv + model * imq_squared_deriv)).squeeze()
 
-    #def dm_general(self, x, y, theta, model=None, predictive=None, tau=None, c_squared=None):
-    #    return NotImplementedError("This method is not implemented in the class. Please implement it in a subclass if needed.")
-    
-    def dm_autograd_normal(self, x, y, theta, model, predictive=None, tau=None, c_squared=None):
-        if isinstance(y, dict):
-            y = y["y"]
-        grad1, grad2 = derivatives_log_likelihood_wrt_y(model, x, y, theta)
-        #print(grad1, grad2)
-        return (grad1 ** 2 + 2 * grad2).squeeze()
+    def dm_general(self, x, y, theta, model=None, predictive=None, tau=None, c_squared=None):
+        return NotImplementedError("This method is not implemented in the class. Please implement it in a subclass if needed.")
 
-    def dm_autograd_weighted(self, x, y, theta, model, predictive, tau=1, c_squared=None):
+    def negative_log_likelihood(self, x, y, theta, model, predictive=None, tau=None, c_squared=None):
         if isinstance(y, dict):
             y = y["y"]
+        theta = theta["theta"]
+
+        distance = torch.square(theta - x).sum(dim=-1)
+        ratio = self.a / (self.m + distance)
+        mu = self.b + ratio.sum(dim=-1, keepdims=True)
+
+        residuals = (y - torch.log(mu))
+        nll = (1 / 2) * torch.log(torch.tensor([2 * torch.pi * self.obs_sd ** 2])) + (1 / (2 * self.obs_sd ** 2)) * (residuals ** 2)
+        return nll.squeeze()
+    
+class score_matching_pharmacokinetic:
+    def __init__(self, w, D_v, epsilon_scale, nu_scale):
+        self.w = w
+        self.D_v = D_v
+        self.epsilon_scale = epsilon_scale
+        self.nu_scale = nu_scale
+
+    def update_params(self, x_list, y_list):
+        return NotImplementedError("This method is not implemented in the class. Please implement it in a subclass if needed.")
+    
+    def dm_normal(self, x, y, theta, model=None, predictive=None, tau=None, c_squared=None):
+        if isinstance(y, dict):
+            y = y["y"]
+        theta = theta["log_theta"].exp()
+
+        k_a, k_e, V = [theta[..., [i]] for i in range(3)]
+        assert (k_a > k_e).all()
+        # compute concentration at time t=xi
+        # shape of mean is [batch, n] where n is number of obs per design
+        mu = ((self.D_v / V) * (k_a / (k_a - k_e)) * (
+                    torch.exp(-torch.einsum("...ijk, ...ik->...ij", x, k_e))
+                    - torch.exp(-torch.einsum("...ijk, ...ik->...ij", x, k_a))))
+        sd = torch.sqrt((mu * self.epsilon_scale) ** 2 + self.nu_scale ** 2)
+
+        model = ((mu - y) / (sd ** 2))
+        model_deriv = (-1 / (sd ** 2))
+
+        return ((model ** 2) + (2 * model_deriv)).squeeze()
+
+    def dm_weighted(self, x, y, theta, model, predictive, tau=1, c_squared=None):
+        if isinstance(y, dict):
+            y = y["y"]
+        theta = theta["log_theta"].exp()
+
+        k_a, k_e, V = [theta[..., [i]] for i in range(3)]
+        assert (k_a > k_e).all()
+        # compute concentration at time t=xi
+        # shape of mean is [batch, n] where n is number of obs per design
+        mu = ((self.D_v / V) * (k_a / (k_a - k_e)) * (
+                    torch.exp(-torch.einsum("...ijk, ...ik->...ij", x, k_e))
+                    - torch.exp(-torch.einsum("...ijk, ...ik->...ij", x, k_a))))
+        sd = torch.sqrt((mu * self.epsilon_scale) ** 2 + self.nu_scale ** 2)
+
         mean = torch.mean(predictive, dim=0)
         #mean = torch.quantile(predictive, q=0.5, dim=0, interpolation="midpoint")
-        
         if c_squared is None:
             c_squared = torch.var(predictive, dim=0)
             #c_squared = iqr(predictive, dim=0) ** 2
-
-        grad1, grad2 = derivatives_log_likelihood_wrt_y(model, x, y, theta)
-
+        
         imq_squared = (((self.w) * ((1 + tau * (((y - mean) ** 2) / c_squared)) ** (-1 / 2))) ** 2)
         imq_squared_deriv = -(self.w ** 2) * ((1 + tau * (((y - mean) ** 2) / c_squared)) ** -2) * (2 * tau * (y - mean) / c_squared)
 
-        return (imq_squared * (grad1 ** 2) + 2 * (imq_squared * grad2 + grad1 * imq_squared_deriv)).squeeze()
+        model = ((mu - y) / (sd ** 2))
+        model_deriv = (-1 / (sd ** 2))
+
+        return (imq_squared * (model ** 2) + 2 * (imq_squared * model_deriv + model * imq_squared_deriv)).squeeze()
+
+    def dm_general(self, x, y, theta, model=None, predictive=None, tau=None, c_squared=None):
+        return NotImplementedError("This method is not implemented in the class. Please implement it in a subclass if needed.")
 
     def negative_log_likelihood(self, x, y, theta, model, predictive=None, tau=None, c_squared=None):
-        log_like, y_var = log_likelihood(model, x, y, theta)
-        return -log_like
+        if isinstance(y, dict):
+            y = y["y"]
+        theta = theta["log_theta"].exp()
+
+        k_a, k_e, V = [theta[..., [i]] for i in range(3)]
+        assert (k_a > k_e).all()
+        # compute concentration at time t=xi
+        # shape of mean is [batch, n] where n is number of obs per design
+        mu = ((self.D_v / V) * (k_a / (k_a - k_e)) * (
+                    torch.exp(-torch.einsum("...ijk, ...ik->...ij", x, k_e))
+                    - torch.exp(-torch.einsum("...ijk, ...ik->...ij", x, k_a))))
+        sd = torch.sqrt((mu * self.epsilon_scale) ** 2 + self.nu_scale ** 2)
+
+        residuals = (y - mu)
+        nll = (1 / 2) * torch.log(2 * torch.pi * sd ** 2) + (1 / (2 * sd ** 2)) * (residuals ** 2)
+        return nll.squeeze()
