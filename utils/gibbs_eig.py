@@ -216,4 +216,4 @@ def nmc_eig(
     terms = conditional_lp - marginal_lp
     nonnan = (~torch.isnan(terms)).sum(0).type_as(terms)
     terms[torch.isnan(terms)] = 0.0
-    return terms.sum(0) / nonnan, conditional_lp.sum(0) / nonnan
+    return terms.sum(0) / nonnan#, conditional_lp.sum(0) / nonnan

@@ -104,67 +104,6 @@ class score_matching_regression:
         nll = (1 / 2) * torch.log(torch.tensor([2 * torch.pi * self.std_y**2])) + (1 / (2 * self.std_y**2)) * (residuals**2)
         return nll.squeeze()
     
-class score_matching_ces:
-    def __init__(self, w, obs_sd):
-        self.w = w
-        self.obs_sd = obs_sd
-
-    def update_params(self, x_list, y_list):
-        return NotImplementedError("This method is not implemented in the class. Please implement it in a subclass if needed.")
-    
-    def dm_final(self, x, y, theta, predictive=None, tau=None, c_squared=None):
-        if isinstance(y, dict):
-            y = y["y"]
-        slope = theta["slope"]
-        rho = 0.01 + 0.99 * theta["rho"].select(-1, 0)
-        alpha = theta["alpha"]
-        rho, slope = rexpand(rho, x.shape[-2]), rexpand(slope, x.shape[-2])
-        d1, d2 = x[..., 0:3], x[..., 3:6]
-        U1rho = (rmv(d1.pow(rho.unsqueeze(-1)), alpha)).pow(1./rho)
-        U2rho = (rmv(d2.pow(rho.unsqueeze(-1)), alpha)).pow(1./rho)
-        mu = slope * (U1rho - U2rho)
-        sigma = slope * self.obs_sd * (1 + torch.norm(d1 - d2, dim=-1, p=2))
-
-        print("mu", mu.shape, "sigma", sigma.shape, "y", y.shape)
-
-        logit_y = torch.log(y / (1 - y))
-        return ((((2 * y) - 1) / (y * (1 - y)) + (- logit_y + mu) / (sigma ** 2 * y * (1 - y))) ** 2) + (2 * (((2 * y ** 2 - 2 * y + 1) / ((y ** 2) * (1 - y) ** 2)) + ((-1 - (1 - 2 * y) * (-logit_y + mu)) / (sigma ** 2 * (y ** 2) * (1 - y) ** 2))))
-    
-    def dm_general(self, x, y, theta, predictive=None, tau=None, c_squared=None):
-        return NotImplementedError("This method is not implemented in the class. Please implement it in a subclass if needed.")
-    
-    def dm_final_weighted(self, x, y, theta, predictive, tau=1, c_squared=None):
-        if isinstance(y, dict):
-            y = y["y"]
-        slope = theta["slope"]
-        rho = 0.01 + 0.99 * theta["rho"].select(-1, 0)
-        alpha = theta["alpha"]
-        rho, slope = rexpand(rho, x.shape[-2]), rexpand(slope, x.shape[-2])
-        d1, d2 = x[..., 0:3], x[..., 3:6]
-        U1rho = (rmv(d1.pow(rho.unsqueeze(-1)), alpha)).pow(1./rho)
-        U2rho = (rmv(d2.pow(rho.unsqueeze(-1)), alpha)).pow(1./rho)
-        mu = slope * (U1rho - U2rho)
-        sigma = slope * 0.005 * (1 + torch.norm(d1 - d2, dim=-1, p=2))
-
-        logit_y = torch.log(y.squeeze() / (1 - y.squeeze()))
-
-        mean = torch.mean(predictive, dim=0)
-        #mean = torch.quantile(predictive, q=0.5, dim=0, interpolation="midpoint")
-        
-        if c_squared is None:
-            c_squared = torch.var(predictive, dim=0)
-            #c_squared = iqr(predictive, dim=0) ** 2
-        
-        imq_squared = (((self.w) * ((1 + tau * (((y - mean) ** 2) / c_squared)) ** (-1 / 2))) ** 2)
-        imq_squared_deriv = -(self.w ** 2) * ((1 + tau * (((y - mean) ** 2) / c_squared)) ** -2) * (2 * tau * (y - mean) / c_squared)
-        #imq_squared_deriv = -(self.w ** 2) * ((1 + (((y - mean) ** 2) / c_squared)) ** -2) * (2 * (y - mean) / c_squared)
-        model = (((2 * y.squeeze()) - 1) / (y.squeeze() * (1 - y.squeeze())) + (- logit_y + mu) / (sigma ** 2 * y.squeeze() * (1 - y.squeeze())))
-        model_deriv = (((2 * y.squeeze() ** 2 - 2 * y.squeeze() + 1) / ((y.squeeze() ** 2) * (1 - y.squeeze()) ** 2)) + ((-1 - (1 - 2 * y.squeeze()) * (-logit_y + mu)) / (sigma ** 2 * (y.squeeze() ** 2) * (1 - y.squeeze()) ** 2)))
-        return imq_squared.squeeze() * (model ** 2) + 2 * (imq_squared.squeeze() * model_deriv + model * imq_squared_deriv.squeeze())
-    
-    def negative_log_likelihood(self, xi, y, theta, predictive=None, tau=None, c_squared=None):
-        return NotImplementedError("This method is not implemented in the class. Please implement it in a subclass if needed.")
-    
 class score_matching_location:
     def __init__(self, w, obs_sd, b, m, a):
         self.w = w
