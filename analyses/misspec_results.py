@@ -10,14 +10,14 @@ def process_file_generic(file_path, columns):
     # Add header if missing
     with open(file_path, "r") as f:
         first_line = f.readline()
-        if not first_line.startswith("Seed;RMSE History;MMD History;Log-Likelihood History;Deployment Time"):
+        if not first_line.startswith("Seed;RMSE History;MMD History;Log-Likelihood History;Max EIG History;Deployment Time"):
             rest = f.read()
         else:
             rest = None
 
     if rest is not None:
         with open(file_path, "w") as f:
-            f.write("Seed;RMSE History;MMD History;Log-Likelihood History;Deployment Time\n")
+            f.write("Seed;RMSE History;MMD History;Log-Likelihood History;;Max EIG History;Deployment Time\n")
             f.write(first_line)
             f.write(rest)
 
