@@ -293,10 +293,10 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
     output_dir = "./location/"
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-    #if not experiment_name:
-    experiment_name = output_dir+f"seed{seed}:{datetime.datetime.now().isoformat()}"
-    #else:
-    #    experiment_name = output_dir+experiment_name
+    if not experiment_name:
+        experiment_name = output_dir+f"seed{seed}:{datetime.datetime.now().isoformat()}"
+    else:
+        experiment_name = output_dir+experiment_name
     results_file = experiment_name + '.result_stream.pickle'
     try:
         os.remove(results_file)
@@ -788,4 +788,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
     main(args.T, 1, args.name, args.typs, args.inference, args.seed, args.lengthscale, args.variance, args.num_acquisition,
          args.observation_sd, args.w, args.N, args.M, args.chosen_loss, args.misspecification, args.actual_observation_sd, args.c_imq, args.b_use_expdecay, args.b_expdecay_imq, args.k, args.d, args.loglevel)
+
 
