@@ -28,8 +28,8 @@ from pyro.contrib.util import lexpand
 from pyro import poutine
 from pyro.infer.autoguide import AutoDiagonalNormal
 
-from utils.gibbs_eig import gibbs_nmc_eig
-from utils.loss_functions import score_matching_pharmacokinetic
+from gibbs_eig import gibbs_nmc_eig
+from loss_functions import score_matching_pharmacokinetic
 
 # Get device for PyTorch (GPU or CPU for training)
 #device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -343,9 +343,9 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
             def data_real_world(design):
                 normal_val = true_model(design)
                 #print("normal_val", normal_val)
-                outlier_mask = dist.Bernoulli(torch.tensor(0.3)).sample(normal_val.shape)
+                outlier_mask = dist.Bernoulli(torch.tensor(0.5)).sample(normal_val.shape)
                 #print("outlier_mask", outlier_mask)
-                outlier = dist.Uniform(-3.5, -1.5).sample(normal_val.shape)
+                outlier = dist.Uniform(3.0, 7.0).sample(normal_val.shape)
                 #print("outlier", outlier)
                 normal_val += - (outlier_mask * outlier)
                 #print("modified normal_val", normal_val)
@@ -379,8 +379,8 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
             gen_loss_fn = dsm.dm_normal
         elif chosen_loss == "neg-log":
             gen_loss_fn = dsm.negative_log_likelihood
-        #else:
-        #    raise ValueError(f"Unknown loss function: {chosen_loss}. Choose from 'score-matching-weighted', 'score-matching-default', or 'neg-log'.")
+        else:
+            raise ValueError(f"Unknown loss function: {chosen_loss}. Choose from 'score-matching-weighted', 'score-matching-default', or 'neg-log'.")
 
         # Generalised ELBO function for SVI
         def generalised_elbo(model, guide, *args, **kwargs):
@@ -416,7 +416,7 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
             y_data = {name: site["value"] for name, site in model_trace.nodes.items() if name == "y"}["y"]
 
             # Compute the loss term
-            loss_sum = -w * torch.sum(torch.stack([gen_loss_fn(x.unsqueeze(0), y.unsqueeze(-1), theta, model, predictive=predictive_samples_dict[tuple(x.cpu().flatten().tolist())], tau=tau, c_squared=c_squared) for x, y in zip(x_data.permute(1, 0, 2, 3), y_data)]), dim=-1)
+            loss_sum = -w * torch.sum(torch.stack([gen_loss_fn(x.unsqueeze(0).unsqueeze(0).unsqueeze(0), y.unsqueeze(-1), theta, model, predictive=predictive_samples_dict[tuple(x.cpu().flatten().tolist())], tau=tau, c_squared=c_squared) for x, y in zip(x_data.flatten(), y_data.flatten())]), dim=-1)
 
             # Compute the log probabilities of the model and guide, using loss_sum to replace the log likelihood
             log_p_t = loss_sum + model_trace.log_prob_sum(site_filter=lambda name, site: site["type"] == "sample" and site["is_observed"] is False)  # remove obs
@@ -569,7 +569,7 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
             results['design_time'] = elapsed
             results['d_star_design'] = d_star_design
             logging.info('design {} {}'.format(d_star_design.squeeze(), d_star_design.shape))
-            d_star_designs = torch.cat([d_star_designs, d_star_design], dim=-3)
+            d_star_designs = torch.cat([d_star_designs, d_star_design], dim=-2)
             print('d_star_designs', d_star_designs.shape)
             y = data_real_world(d_star_design)
             ys = torch.cat([ys, y], dim=-1)
@@ -602,13 +602,21 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
             #print(X, X.shape)
             #print(predictive_samples.shape)
             predictive_samples_dict = {}
-            for i in range(d_star_designs.shape[1]):
-                #print(d_star_designs[:, i, :, :])
-                samples = compute_predictive_distribution(model, d_star_designs[:, i, :, :], num_samples=1000).squeeze(-1).squeeze(-2).unsqueeze(-1)
-                l_flat = tuple(d_star_designs[:, i, :, :].flatten().tolist())
+            for i in range(d_star_designs.shape[2]):
+                #print(d_star_designs[:, :, i, :])
+                samples = compute_predictive_distribution(model, d_star_designs[:, :, i, :], num_samples=1000).squeeze(-1).squeeze(-2).unsqueeze(-1)
+                l_flat = tuple(d_star_designs[:, :, i, :].flatten().tolist())
                 predictive_samples_dict[l_flat] = samples
                 print(f"Predictive samples for design {l_flat}: {predictive_samples_dict[l_flat].shape}")
                 print(l_flat, torch.mean(predictive_samples_dict[l_flat], dim=0), torch.var(predictive_samples_dict[l_flat], dim=0), torch.quantile(predictive_samples_dict[l_flat], q=0.5, dim=0, interpolation="midpoint"), iqr(predictive_samples_dict[l_flat], dim=0) ** 2)
+
+            # for l in d_star_designs:
+            #    idx = (X == l).all(dim=-1).nonzero(as_tuple=True)[1].item()
+            #    print(idx)
+            #    l_flat = tuple(l.flatten().tolist())
+            #    predictive_samples_dict[l_flat] = predictive_samples[:, idx, :].squeeze(-1)  # (num_samples, 1)
+            #    print(f"Predictive samples for design {l_flat}: {predictive_samples_dict[l_flat].shape}")
+            #    print(l_flat, torch.mean(predictive_samples_dict[l_flat], dim=0), torch.var(predictive_samples_dict[l_flat], dim=0), torch.quantile(predictive_samples_dict[l_flat], q=0.5, dim=0, interpolation="midpoint"), iqr(predictive_samples_dict[l_flat], dim=0) ** 2)
 
             #print(predictive_samples_dict.keys())
 
@@ -741,15 +749,15 @@ if __name__ == "__main__":
     parser.add_argument("--lengthscale", nargs="?", default=20.0, type=float)
     parser.add_argument("--variance", nargs="?", default=10.0, type=float)
     parser.add_argument("--loglevel", default="info", type=str)
-    parser.add_argument("--num-acquisition", default=100, type=int)
+    parser.add_argument("--num-acquisition", default=500, type=int)
     parser.add_argument("--assumed-epsilon-scale", default=0.01, type=float)
     parser.add_argument("--assumed-nu-scale", default=0.1, type=float)
     parser.add_argument("--w", default=1.0, type=float, help="Learning rate for posterior")
     parser.add_argument("--N", type=int, default=10000, help="Number of samples for EIG estimation (N)")
     parser.add_argument("--M", type=int, default=100, help="Number of samples for EIG estimation (M)")
-    parser.add_argument("--chosen-loss", default="neg-log", type=str,
+    parser.add_argument("--chosen-loss", default="score-matching-weighted", type=str,
                         help="Choose from 'score-matching-weighted' or 'score-matching-default'.")
-    parser.add_argument("--misspecification", default="none", type=str,
+    parser.add_argument("--misspecification", default="outlier", type=str,
                         help="Choose from 'none', 'outlier', or 'error-dist'.")
     parser.add_argument("--actual-epsilon-scale", default=0.01, type=float)
     parser.add_argument("--actual-nu-scale", default=0.1, type=float)
@@ -762,4 +770,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
     main(args.T, 1, args.name, args.typs, args.inference, args.seed, args.lengthscale, args.variance, args.num_acquisition,
          args.assumed_epsilon_scale, args.assumed_nu_scale, args.w, args.N, args.M, args.chosen_loss, args.misspecification, args.actual_epsilon_scale, args.actual_nu_scale, args.c_imq, args.b_use_expdecay, args.b_expdecay_imq, args.loglevel)
-

@@ -28,8 +28,8 @@ from pyro.contrib.util import lexpand
 from pyro import poutine
 from pyro.infer.autoguide import AutoDiagonalNormal
 
-from utils.gibbs_eig import gibbs_nmc_eig
-from utils.loss_functions import score_matching_location
+from gibbs_eig import gibbs_nmc_eig
+from loss_functions import score_matching_location
 
 # Get device for PyTorch (GPU or CPU for training)
 #device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -284,6 +284,11 @@ def elboguide(design, dim=1, k=2, d=2):
         theta_shape = batch_shape + theta_mu.shape[-2:]
         pyro.sample("theta", dist.Normal(theta_mu.expand(theta_shape), theta_sig.expand(theta_shape)).to_event(2))
 
+def genelboguide(design, dim=1, k=2, d=2):
+    theta_mu = pyro.param("theta_mu", torch.zeros(dim, 1, k, d))
+    theta_sig = pyro.param("theta_sig", torch.ones(dim, 1, k, d), constraint=torch.distributions.constraints.positive)
+    pyro.sample("theta", dist.Normal(theta_mu, theta_sig).to_event(2))
+
 def main(num_steps, num_parallel, experiment_name, typs, inference, seed, lengthscale, variance, num_acquisition, obs_sd, w, N, M, chosen_loss, misspecification, actual_observation_sd, c_imq, b_use_expdecay, b_expdecay_imq, k, d, loglevel):
     numeric_level = getattr(logging, loglevel.upper(), None)
     if not isinstance(numeric_level, int):
@@ -414,8 +419,11 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
             x_data = args[0]
             y_data = {name: site["value"] for name, site in model_trace.nodes.items() if name == "y"}["y"]
 
+            for x, y in zip(x_data.permute(1, 0, 2, 3), y_data.flatten()):
+                print(x, y)
+
             # Compute the loss term
-            loss_sum = -w * torch.sum(torch.stack([gen_loss_fn(x.unsqueeze(0), y.unsqueeze(-1), theta, model, predictive=predictive_samples_dict[tuple(x.cpu().flatten().tolist())], tau=tau, c_squared=c_squared) for x, y in zip(x_data.permute(1, 0, 2, 3), y_data)]), dim=-1)
+            loss_sum = -w * torch.sum(torch.stack([gen_loss_fn(x.unsqueeze(0), y.unsqueeze(-1), theta, model, predictive=predictive_samples_dict[tuple(x.cpu().flatten().tolist())], tau=tau, c_squared=c_squared) for x, y in zip(x_data.permute(1, 0, 2, 3), y_data.flatten())]), dim=-1)
 
             # Compute the log probabilities of the model and guide, using loss_sum to replace the log likelihood
             log_p_t = loss_sum + model_trace.log_prob_sum(site_filter=lambda name, site: site["type"] == "sample" and site["is_observed"] is False)  # remove obs
@@ -640,13 +648,14 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
 
             if inference == "bayesian":
                 elbo_loss = Trace_ELBO()
+                guide = lambda *args, **kwargs: elboguide(*args, k=k, d=d, **kwargs) # AutoDiagonalNormal(conditioned_model) not functioning properly
             elif inference == "gibbs":
                 elbo_loss = generalised_elbo
+                guide = lambda *args, **kwargs: genelboguide(*args, k=k, d=d, **kwargs) # AutoDiagonalNormal(conditioned_model) not functioning properly
             else:
                 raise ValueError(f"Unknown inference type: {inference}. Choose from 'bayesian' or 'gibbs'.")
 
             conditioned_model = pyro.condition(model, {"y": ys})
-            guide = lambda *args, **kwargs: elboguide(*args, k=k, d=d, **kwargs) # AutoDiagonalNormal(conditioned_model) not functioning properly
             svi = SVI(conditioned_model,
                     guide,
                     Adam({"lr": 0.005}),
@@ -759,11 +768,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Location Finding"
                                                  " iterated experiment design")
     parser.add_argument("--seed", type=int, default=50, help="Random seed for reproducibility")
-    parser.add_argument("--T", type=int, default=1, help="Number of experiments to run")
+    parser.add_argument("--T", type=int, default=10, help="Number of experiments to run")
     #parser.add_argument("--num-parallel", nargs="?", default=1, type=int)
     parser.add_argument("--name", nargs="?", default="nmc", type=str)
-    parser.add_argument("--typs", nargs="?", default="random", type=str)
-    parser.add_argument("--inference", nargs="?", default="gibbs", type=str)
+    parser.add_argument("--typs", nargs="?", default="nmc", type=str)
+    parser.add_argument("--inference", nargs="?", default="bayesian", type=str)
     parser.add_argument("--lengthscale", nargs="?", default=15.0, type=float)
     parser.add_argument("--variance", nargs="?", default=4.0, type=float)
     parser.add_argument("--loglevel", default="info", type=str)
@@ -788,5 +797,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
     main(args.T, 1, args.name, args.typs, args.inference, args.seed, args.lengthscale, args.variance, args.num_acquisition,
          args.observation_sd, args.w, args.N, args.M, args.chosen_loss, args.misspecification, args.actual_observation_sd, args.c_imq, args.b_use_expdecay, args.b_expdecay_imq, args.k, args.d, args.loglevel)
-
-
