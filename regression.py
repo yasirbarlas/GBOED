@@ -13,8 +13,8 @@ from pyro.contrib.oed.eig import nmc_eig
 from pyro.infer.predictive import Predictive
 from pyro.util import warn_if_nan
 
-from gibbs_eig import gibbs_nmc_eig
-from loss_functions import score_matching_regression
+from utils.gibbs_eig import gibbs_nmc_eig
+from utils.loss_functions import score_matching_regression
 
 import argparse
 
@@ -611,4 +611,5 @@ if __name__ == "__main__":
         b_expdecay_imq=args.b_expdecay_imq,
         directory=f"regression/"
     )
+
 
