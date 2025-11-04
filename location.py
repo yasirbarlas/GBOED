@@ -28,8 +28,8 @@ from pyro.contrib.util import lexpand
 from pyro import poutine
 from pyro.infer.autoguide import AutoDiagonalNormal
 
-from gibbs_eig import gibbs_nmc_eig
-from loss_functions import score_matching_location
+from utils.gibbs_eig import gibbs_nmc_eig
+from utils.loss_functions import score_matching_location
 
 # Get device for PyTorch (GPU or CPU for training)
 #device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -797,3 +797,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     main(args.T, 1, args.name, args.typs, args.inference, args.seed, args.lengthscale, args.variance, args.num_acquisition,
          args.observation_sd, args.w, args.N, args.M, args.chosen_loss, args.misspecification, args.actual_observation_sd, args.c_imq, args.b_use_expdecay, args.b_expdecay_imq, args.k, args.d, args.loglevel)
+
