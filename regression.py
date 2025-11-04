@@ -1,5 +1,6 @@
 import torch
 import os
+import argparse
 import pyro
 import pyro.distributions as dist
 import matplotlib.pyplot as plt
@@ -15,8 +16,6 @@ from pyro.util import warn_if_nan
 
 from utils.gibbs_eig import gibbs_nmc_eig
 from utils.loss_functions import score_matching_regression
-
-import argparse
 
 # Get device for PyTorch (GPU or CPU for training)
 #device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -611,5 +610,6 @@ if __name__ == "__main__":
         b_expdecay_imq=args.b_expdecay_imq,
         directory=f"regression/"
     )
+
 
 
