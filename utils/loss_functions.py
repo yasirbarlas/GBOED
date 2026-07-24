@@ -2,6 +2,7 @@ import torch
 import pyro
 from pyro.contrib.util import rexpand, rmv
 from pyro import poutine
+from censored_sigmoid_normal import CensoredSigmoidNormal # used for CES only
 
 def iqr(tensor, dim=None, keepdim=False):
     q75 = torch.quantile(tensor, 0.75, dim=dim, keepdim=keepdim, interpolation="midpoint")
@@ -118,7 +119,8 @@ class score_matching_location:
     def dm_normal(self, x, y, theta, model=None, predictive=None, tau=None, c_squared=None):
         if isinstance(y, dict):
             y = y["y"]
-        theta = theta["theta"]
+        if isinstance(theta, dict):
+            theta = theta["theta"]
 
         distance = torch.square(theta - x).sum(dim=-1)
         ratio = self.a / (self.m + distance)
@@ -132,7 +134,8 @@ class score_matching_location:
     def dm_weighted(self, x, y, theta, model, predictive, tau=1, c_squared=None):
         if isinstance(y, dict):
             y = y["y"]
-        theta = theta["theta"]
+        if isinstance(theta, dict):
+            theta = theta["theta"]
 
         distance = torch.square(theta - x).sum(dim=-1)
         ratio = self.a / (self.m + distance)
@@ -143,7 +146,7 @@ class score_matching_location:
         if c_squared is None:
             c_squared = torch.var(predictive, dim=0)
             #c_squared = iqr(predictive, dim=0) ** 2
-        
+  
         imq_squared = (((self.w) * ((1 + tau * (((y - mean) ** 2) / c_squared)) ** (-1 / 2))) ** 2)
         imq_squared_deriv = -(self.w ** 2) * ((1 + tau * (((y - mean) ** 2) / c_squared)) ** -2) * (2 * tau * (y - mean) / c_squared)
 
@@ -158,7 +161,8 @@ class score_matching_location:
     def negative_log_likelihood(self, x, y, theta, model, predictive=None, tau=None, c_squared=None):
         if isinstance(y, dict):
             y = y["y"]
-        theta = theta["theta"]
+        if isinstance(theta, dict):
+            theta = theta["theta"]
 
         distance = torch.square(theta - x).sum(dim=-1)
         ratio = self.a / (self.m + distance)
@@ -181,7 +185,9 @@ class score_matching_pharmacokinetic:
     def dm_normal(self, x, y, theta, model=None, predictive=None, tau=None, c_squared=None):
         if isinstance(y, dict):
             y = y["y"]
-        theta = theta["log_theta"].exp()
+        if isinstance(theta, dict):
+            theta = theta["log_theta"]
+        theta = theta.exp()
 
         k_a, k_e, V = [theta[..., [i]] for i in range(3)]
         assert (k_a > k_e).all()
@@ -200,7 +206,9 @@ class score_matching_pharmacokinetic:
     def dm_weighted(self, x, y, theta, model, predictive, tau=1, c_squared=None):
         if isinstance(y, dict):
             y = y["y"]
-        theta = theta["log_theta"].exp()
+        if isinstance(theta, dict):
+            theta = theta["log_theta"]
+        theta = theta.exp()
 
         k_a, k_e, V = [theta[..., [i]] for i in range(3)]
         assert (k_a > k_e).all()
@@ -231,7 +239,9 @@ class score_matching_pharmacokinetic:
     def negative_log_likelihood(self, x, y, theta, model, predictive=None, tau=None, c_squared=None):
         if isinstance(y, dict):
             y = y["y"]
-        theta = theta["log_theta"].exp()
+        if isinstance(theta, dict):
+            theta = theta["log_theta"]
+        theta = theta.exp()
 
         k_a, k_e, V = [theta[..., [i]] for i in range(3)]
         assert (k_a > k_e).all()
@@ -245,3 +255,41 @@ class score_matching_pharmacokinetic:
         residuals = (y - mu)
         nll = (1 / 2) * torch.log(2 * torch.pi * sd ** 2) + (1 / (2 * sd ** 2)) * (residuals ** 2)
         return nll.squeeze()
+    
+class score_matching_ces:
+    def __init__(self, w, obs_sd):
+        self.w = w
+        self.obs_sd = obs_sd
+
+    def update_params(self, x_list, y_list):
+        return NotImplementedError("This method is not implemented in the class. Please implement it in a subclass if needed.")
+    
+    def dm_final(self, x, y, theta, predictive=None, tau=None, c_squared=None):
+        return NotImplementedError("This method is not implemented in the class. Please implement it in a subclass if needed.")
+        
+    def dm_general(self, x, y, theta, predictive=None, tau=None, c_squared=None):
+        return NotImplementedError("This method is not implemented in the class. Please implement it in a subclass if needed.")
+    
+    def dm_final_weighted(self, x, y, theta, predictive, tau=1, c_squared=None):
+        return NotImplementedError("This method is not implemented in the class. Please implement it in a subclass if needed.")
+    
+    def negative_log_likelihood(self, x, y, theta, predictive=None, tau=None, c_squared=None):
+        if isinstance(y, dict):
+            y = y["y"]
+
+        epsilon = torch.tensor(2**-22)
+
+        slope = theta["slope"]
+        rho = 0.01 + 0.99 * theta["rho"].select(-1, 0)
+        alpha = theta["alpha"]
+        rho, slope = rexpand(rho, x.shape[-2]), rexpand(slope, x.shape[-2])
+        d1, d2 = x[..., 0:3], x[..., 3:6]
+        U1rho = (rmv(d1.pow(rho.unsqueeze(-1)), alpha)).pow(1./rho)
+        U2rho = (rmv(d2.pow(rho.unsqueeze(-1)), alpha)).pow(1./rho)
+        mu = slope * (U1rho - U2rho)
+        sigma = slope * self.obs_sd * (1 + torch.norm(d1 - d2, dim=-1, p=2))
+
+        distribution = CensoredSigmoidNormal(mu, sigma, 1 - epsilon, epsilon).to_event(1)
+
+        distribution_log_prob = distribution.log_prob(y)
+        return -distribution_log_prob.squeeze()
