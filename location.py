@@ -11,6 +11,7 @@ from contextlib import ExitStack
 import logging
 import numbers
 import random
+import copy
 
 import pyro
 import pyro.optim as optim
@@ -19,8 +20,8 @@ from pyro.contrib.util import iter_plates_to_shape, rexpand, rmv
 from pyro.contrib.oed.eig import nmc_eig
 import pyro.contrib.gp as gp
 
-from pyro.infer import SVI, Trace_ELBO
-from pyro.optim import Adam
+from pyro.infer import MCMC, NUTS, SVI, Trace_ELBO
+from pyro.optim import Adam, ClippedAdam
 from pyro.util import warn_if_nan
 import numpy as np
 from pyro.infer.predictive import Predictive
@@ -28,12 +29,16 @@ from pyro.contrib.util import lexpand
 from pyro import poutine
 from pyro.infer.autoguide import AutoDiagonalNormal
 
-from utils.gibbs_eig import gibbs_nmc_eig
-from utils.loss_functions import score_matching_location
+from pyro.distributions.transforms import SplineAutoregressive, SplineCoupling, AffineAutoregressive, Permute
+from pyro.nn import AutoRegressiveNN, DenseNN
+
+from gibbs_eig import gibbs_nmc_eig
+from loss_functions import score_matching_location
 
 # Get device for PyTorch (GPU or CPU for training)
-#device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-#torch.set_default_device(device)
+# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# torch.set_default_device(device)
+# print("Using device:", device)
 
 # Set precision for PyTorch
 torch.set_default_dtype(torch.float32)
@@ -74,14 +79,13 @@ def compute_predictive_distribution(model, xi, num_samples=1000):
         model: The Pyro model to sample from.
         xi: The design points (tensor).
         num_samples: Number of samples to draw from the predictive distribution.
-
+        theta_samples: Samples from the posterior distribution of the model parameters.
     Returns:
         Samples from the predictive distribution (tensor).
     """
     expanded_design = lexpand(xi, num_samples)  # N copies of the model
     trace = poutine.trace(model).get_trace(expanded_design)
-    y_values = trace.nodes["y"]["value"]
-    return y_values
+    return trace.nodes["y"]["value"]
 
     #predictive = Predictive(model, num_samples=num_samples)
     #return predictive(xi)["y"]
@@ -251,7 +255,7 @@ def compute_mean_log_likelihood(true_values, model, xi, num_theta_samples=100):
 # TODO read from torch float spec
 epsilon = torch.tensor(2**-22)
 
-def make_location_model(theta_mu, theta_sig, alpha, b, m, observation_sd, observation_label="y"):
+def make_location_model(empirical_prior, alpha, b, m, observation_sd, observation_label="y"):
     def location_model(design):
         if is_bad(design):
             raise ArithmeticError("bad design, contains nan or inf")
@@ -259,10 +263,11 @@ def make_location_model(theta_mu, theta_sig, alpha, b, m, observation_sd, observ
         with ExitStack() as stack:
             for plate in iter_plates_to_shape(batch_shape):
                 stack.enter_context(plate)
-            theta_shape = batch_shape + theta_mu.shape[-2:]
-            theta = pyro.sample("theta", dist.Normal(theta_mu.expand(theta_shape), theta_sig.expand(theta_shape)).to_event(2))
-            #print("theta", theta, theta.shape)
-            #print("design", design, design.shape)
+            #theta_shape = batch_shape + theta_mu.shape[-2:]
+            #theta = pyro.sample("theta", dist.Normal(theta_mu.expand(theta_shape), theta_sig.expand(theta_shape)).to_event(2))
+            theta = pyro.sample("theta", empirical_prior)
+            #print("theta", theta.shape)
+            #print("design", design.shape)
             distance = torch.square(theta - design).sum(dim=-1)
             #print("distance", distance.shape, distance)
             ratio = alpha / (m + distance)
@@ -274,20 +279,30 @@ def make_location_model(theta_mu, theta_sig, alpha, b, m, observation_sd, observ
 
     return location_model
 
-def elboguide(design, dim=1, k=2, d=2):
-    theta_mu = pyro.param("theta_mu", torch.zeros(dim, 1, k, d))
-    theta_sig = pyro.param("theta_sig", torch.ones(dim, 1, k, d), constraint=torch.distributions.constraints.positive)
-    batch_shape = design.shape[:-2]
-    with ExitStack() as stack:
-        for plate in iter_plates_to_shape(batch_shape):
-            stack.enter_context(plate)
-        theta_shape = batch_shape + theta_mu.shape[-2:]
-        pyro.sample("theta", dist.Normal(theta_mu.expand(theta_shape), theta_sig.expand(theta_shape)).to_event(2))
-
+# Mean-Field Variational Inference (not good for location finding, use MCMC instead as already done)
 def genelboguide(design, dim=1, k=2, d=2):
     theta_mu = pyro.param("theta_mu", torch.zeros(dim, 1, k, d))
     theta_sig = pyro.param("theta_sig", torch.ones(dim, 1, k, d), constraint=torch.distributions.constraints.positive)
     pyro.sample("theta", dist.Normal(theta_mu, theta_sig).to_event(2))
+
+class EmpiricalPrior(dist.TorchDistribution):
+    arg_constraints = {}
+    support = torch.distributions.constraints.real
+    has_rsample = False
+
+    def __init__(self, samples):
+        self.samples = samples
+        self.num_samples = samples.shape[0]
+        batch_shape = torch.Size()
+        event_shape = samples.shape[1:]
+        super().__init__(batch_shape=batch_shape, event_shape=event_shape)
+
+    def sample(self, sample_shape=torch.Size()):
+        idx = torch.randint(0, self.num_samples, sample_shape, device=self.samples.device)
+        return self.samples[idx]
+
+    def log_prob(self, value):
+        return torch.zeros(value.shape[:-len(self.event_shape)], device=value.device)
 
 def main(num_steps, num_parallel, experiment_name, typs, inference, seed, lengthscale, variance, num_acquisition, obs_sd, w, N, M, chosen_loss, misspecification, actual_observation_sd, c_imq, b_use_expdecay, b_expdecay_imq, k, d, loglevel):
     numeric_level = getattr(logging, loglevel.upper(), None)
@@ -327,35 +342,31 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
         alpha = 1
         b = 0.1
         m = 0.0001
-        
-        #prior = make_location_model(torch.zeros(num_parallel, 1, k, d), torch.zeros(num_parallel, 1, k, d), alpha, b, m, observation_sd)
 
-        theta_mu, theta_sig = torch.zeros(num_parallel, 1, k, d), torch.ones(num_parallel, 1, k, d)
+        theta_mu  = torch.zeros(num_parallel, 1, k, d)
+        theta_sig = torch.ones(num_parallel, 1, k, d)
+        empirical_prior = dist.Normal(theta_mu, theta_sig).to_event(2)
 
-        # Use only the first d numbers in each row for true_theta
-        full_true_theta = torch.tensor([[[[1.5, -1.3, 0.1, -1.8, -0.7, -1.1, 0.4, 0.4, -2.0, -1.2, -0.3, 0.2, 1.6, -1.2, 1.5, 0.8], 
-                         [-1.8, 0.5, 1.9, -0.2, -1.7, 1.4, -0.5, 2.0, -1.1, 1.2, 1.6, -2.0, -0.1, 0.0, -1.6, -1.3]]]])
-        true_theta = full_true_theta[..., :d]
-
+        true_theta = empirical_prior.sample()
         print("true_theta", true_theta)
 
         # Define the true model based on the type of misspecification
-        true_model = pyro.condition(make_location_model(theta_mu, theta_sig, alpha, b, m, observation_sd), {"theta": true_theta})
+        true_model = pyro.condition(make_location_model(empirical_prior, alpha, b, m, observation_sd), {"theta": true_theta})
         if misspecification == "none":
             data_real_world = true_model
         elif misspecification == "outlier":
             def data_real_world(design):
                 normal_val = true_model(design)
                 #print("normal_val", normal_val)
-                outlier_mask = dist.Bernoulli(torch.tensor(0.3)).sample(normal_val.shape)
+                outlier_mask = dist.Bernoulli(torch.tensor(0.3)).sample()
                 #print("outlier_mask", outlier_mask)
-                outlier = dist.Uniform(3 * observation_sd, 7 * observation_sd).sample(normal_val.shape)
+                outlier = dist.Uniform(3 * observation_sd, 7 * observation_sd).sample()
                 #print("outlier", outlier)
                 normal_val += - (outlier_mask * outlier)
                 #print("modified normal_val", normal_val)
                 return normal_val
         elif misspecification == "error-dist":
-            true_model = pyro.condition(make_location_model(theta_mu, theta_sig, alpha, b, m, actual_observation_sd), {"theta": true_theta})
+            true_model = pyro.condition(make_location_model(empirical_prior, alpha, b, m, actual_observation_sd), {"theta": true_theta})
             data_real_world = true_model
         else:
             raise ValueError(f"Unknown misspecification type: {misspecification}. Choose from 'none', 'outlier', or 'error-dist'.")
@@ -364,10 +375,8 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
         ys = torch.tensor([])
         history = [(theta_mu.detach().clone().cpu().numpy(), theta_sig.detach().clone().cpu().numpy())]
 
-        model = make_location_model(theta_mu, theta_sig, alpha, b, m, observation_sd)
+        model = make_location_model(empirical_prior, alpha, b, m, observation_sd)
 
-        #eigs = []
-        #losses = []
         rmses = []
         mmds = []
         log_likelihoods = []
@@ -386,57 +395,48 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
         else:
             raise ValueError(f"Unknown loss function: {chosen_loss}. Choose from 'score-matching-weighted', 'score-matching-default', or 'neg-log'.")
 
-        # Generalised ELBO function for SVI
-        def generalised_elbo(model, guide, *args, **kwargs):
-            """
-            Computes the generalised ELBO as a single loss function.
+        # Generalised ELBO function for SVI, not used in the current implementation but kept for reference
+        def generalised_elbo(model, guide, *args, num_particles=5, **kwargs):
+            losses = []
 
-            This function is used to compute the loss for the SVI step.
-            It computes the ELBO by sampling from the guide and then computing the log probabilities of the model and guide.
+            for _ in range(num_particles):
+                guide_trace = pyro.poutine.trace(guide).get_trace(*args, **kwargs)
+                guide_trace.compute_log_prob()
 
-            Args:
-                model: The model function to compute the log probability of the data.
-                guide: The guide function to compute the log probability of the latent variables.
-                *args: Additional arguments to pass to the model and guide.
-                **kwargs: Additional keyword arguments to pass to the model and guide.
+                theta = guide_trace.nodes["theta"]["value"]
 
-            Returns:
-                loss: The computed loss (negative ELBO) value.
-            """
+                model_trace = pyro.poutine.trace(pyro.poutine.replay(model, trace=guide_trace)).get_trace(*args, **kwargs)
+                model_trace.compute_log_prob()
 
-            # Run the guide to get q(theta)
-            guide_trace = pyro.poutine.trace(guide).get_trace(*args, **kwargs)
-            guide_trace.compute_log_prob()
+                x_data = args[0]
+                y_data = model_trace.nodes["y"]["value"]
 
-            # Sample theta from the guide
-            theta = {name: site["value"] for name, site in guide_trace.nodes.items() if site["type"] == "sample"}
+                predictive = pred_elbo_samples #predictive_samples_tensor[indices].squeeze(-1).permute(0, 2, 1, 3).squeeze(0)
+                y_batch = y_data.unsqueeze(-1)
 
-            # Run the model with the same theta sample
-            model_trace = pyro.poutine.trace(pyro.poutine.replay(model, trace=guide_trace)).get_trace(*args, **kwargs)
-            model_trace.compute_log_prob()
+                loss_terms = gen_loss_fn(x_data, y_batch, theta, model, predictive=predictive, tau=tau, c_squared=c_squared)
+                loss_sum = -w * loss_terms.sum()
 
-            # Extract data and experimental conditions
-            x_data = args[0]
-            y_data = {name: site["value"] for name, site in model_trace.nodes.items() if name == "y"}["y"]
+                # Compute the log probabilities of the model and guide, using loss_sum to replace the log likelihood
+                log_p_t = loss_sum + model_trace.log_prob_sum(site_filter=lambda name, site: site["type"] == "sample" and site["is_observed"] is False)  # remove obs
+                log_q_t = guide_trace.log_prob_sum()
 
-            for x, y in zip(x_data.permute(1, 0, 2, 3), y_data.flatten()):
-                print(x, y)
-
-            # Compute the loss term
-            loss_sum = -w * torch.sum(torch.stack([gen_loss_fn(x.unsqueeze(0), y.unsqueeze(-1), theta, model, predictive=predictive_samples_dict[tuple(x.cpu().flatten().tolist())], tau=tau, c_squared=c_squared) for x, y in zip(x_data.permute(1, 0, 2, 3), y_data.flatten())]), dim=-1)
-
-            # Compute the log probabilities of the model and guide, using loss_sum to replace the log likelihood
-            log_p_t = loss_sum + model_trace.log_prob_sum(site_filter=lambda name, site: site["type"] == "sample" and site["is_observed"] is False)  # remove obs
-            log_q_t = guide_trace.log_prob_sum()
-
-            # Compute the ELBO
-            elbo_particle = log_p_t - log_q_t
-            #elbo_particle = model_trace.log_prob_sum() - log_q_t # Normal Bayesian inference
-
-            # Loss is negative ELBO
-            loss = -elbo_particle
+                # Compute the ELBO
+                losses.append(-(log_p_t - log_q_t))
+            
+            loss = torch.stack(losses).mean()
             warn_if_nan(loss, "Generalised ELBO loss")
             return loss
+
+        # Define the log potential function for MCMC sampling
+        def make_log_potential(empirical_prior, x_data, y_data, predictive, tau, c_squared, model, gen_loss_fn, w):
+            def log_potential(theta):
+                loss_terms = gen_loss_fn(x_data, y_data.unsqueeze(-1), theta, model, predictive=predictive, tau=tau, c_squared=c_squared,)
+                loss = loss_terms.sum()
+                log_prior = dist.Normal(torch.zeros(num_parallel, 1, k, d), torch.ones(num_parallel, 1, k, d)).to_event(2).log_prob(theta)
+                return -w * loss + log_prior
+
+            return log_potential
 
         time_before_experiment = time.time()
 
@@ -459,7 +459,7 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
                 if b_expdecay_imq <= 0:
                     c_squared = None
                 else:
-                    c_squared = get_c_exponential_decay(experiment, rate=b_expdecay_imq, q1=9, q2=1) ** 2
+                    c_squared = get_c_exponential_decay(experiment, rate=b_expdecay_imq, q1=1.8, q2=0.2) ** 2
             
             # Initialisation
             noise = torch.tensor(0.2).pow(2)
@@ -488,36 +488,6 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
             results['rmse'], results['mmd'], results['log_likelihood'] = rmse_predictive, mmd_predictive, log_likelihood_predictive
 
             if typ in ['nmc', 'gibbs-nmc']:
-                # Initialisation
-                #noise = torch.tensor(0.2).pow(2)
-                # X = 100*rexpand(torch.rand((num_parallel, num_acq)), 4)
-                #X = -4 + 8 * torch.rand((num_parallel, num_acquisition, 1, design_dim))
-                
-                # Ensures designs are the same (assuming seed is the same) no matter the loss function used for computing metrics (fairer comparison of results)
-                #predictive_samples = compute_predictive_distribution(model, X, num_samples=1000).squeeze(-1).squeeze(-2).unsqueeze(-1)
-                #true_values = true_model(lexpand(X, predictive_samples.shape[0])).squeeze(-1).squeeze(-2).unsqueeze(-1)
-                #print(predictive_samples.shape, true_values.shape)
-
-                #rmse_predictive = compute_rmse_predictive_vs_true(predictive_samples, true_values)
-                #rmses.append(rmse_predictive)
-                #print(f"RMSE between predictive distribution and true model: {rmse_predictive}")
-
-                #mmd_predictive = compute_mmd_vectorized_per_dim(predictive_samples, true_values, bandwidths=median_heuristic_bandwidth_per_dim(predictive_samples, true_values))
-                #mmds.append(mmd_predictive)
-                #print(f"MMD between predictive distribution and true model: {mmd_predictive}")
-
-                #log_likelihood_predictive = compute_mean_log_likelihood(true_values, model, X.squeeze(0), num_theta_samples=100)
-                #log_likelihoods.append(log_likelihood_predictive)
-                #print(f"Mean log-likelihood between predictive distribution and true model: {log_likelihood_predictive}")
-
-                #logging.info("RMSE {} \n MMD {} \n Log Likelihood {}".format(
-                #    rmse_predictive, mmd_predictive, log_likelihood_predictive))
-                
-                #results['rmse'], results['mmd'], results['log_likelihood'] = rmse_predictive, mmd_predictive, log_likelihood_predictive
-                
-                #print(X, X.shape)
-                #x_f = X
-
                 if typ == 'nmc':
                     def f(X):
                         return torch.cat([nmc_eig(model, X, ["y"],
@@ -597,7 +567,6 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
 
             #print(X, X.shape)
             #print(y, y.shape)
-
             elapsed = time.time() - t
             logging.info('elapsed design time {}'.format(elapsed))
             results['design_time'] = elapsed
@@ -610,78 +579,32 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
             logging.info('ys {} {}'.format(ys.squeeze(), ys.shape))
             results['y'] = y
 
-            # if experiment == 0:
-            #     print("Initial model statistics:")
-            #     predictive_samples = compute_predictive_distribution(model, X.unsqueeze(2).unsqueeze(0), num_samples=1000).squeeze(-1).squeeze(-2).unsqueeze(-1)
-            #     true_values = true_model(lexpand(X.unsqueeze(2).unsqueeze(0), predictive_samples.shape[0])).squeeze(-1).squeeze(-2).unsqueeze(-1)
+            pred_elbo_samples = compute_predictive_distribution(model, d_star_designs, num_samples=1000).squeeze(-1).squeeze(-2).unsqueeze(-1)
+            log_potential = make_log_potential(empirical_prior, d_star_designs, ys, pred_elbo_samples, tau, c_squared, model, gen_loss_fn, w)
+            theta_init = dist.Normal(torch.zeros(num_parallel, 1, k, d), torch.ones(num_parallel, 1, k, d)).to_event(2).sample()
 
-            #     rmse_predictive = compute_rmse_predictive_vs_true(predictive_samples, true_values)
-            #     rmses.append(rmse_predictive)
-            #     #print(f"RMSE between predictive distribution and true model: {rmse_predictive}")
+            nuts = NUTS(potential_fn=lambda params: -log_potential(params["theta"]))
+            mcmc = MCMC(nuts, warmup_steps=10000, num_samples=100000, initial_params={"theta": theta_init})
+            mcmc.run()
 
-            #     mmd_predictive = compute_mmd_vectorized_per_dim(predictive_samples, true_values, bandwidths=median_heuristic_bandwidth_per_dim(predictive_samples, true_values))
-            #     mmds.append(mmd_predictive)
-            #     #print(f"MMD between predictive distribution and true model: {mmd_predictive}")
+            # For SVI, not used in the current implementation but kept for reference
+            # conditioned_model = pyro.condition(model, {"y": ys})
+            # svi = SVI(conditioned_model,
+            #         genelboguide,
+            #         Adam({"lr": 0.005}),
+            #         loss=generalised_elbo)
+            # num_iters = 10000
+            # for i in range(num_iters + 1):
+            #     elbo = svi.step(d_star_designs)
+            #     if i % 250 == 0:
+            #         print(f'({i})', elbo)
 
-            #     log_likelihood_predictive = compute_mean_log_likelihood(true_values, model, X.unsqueeze(2), num_theta_samples=100)
-            #     log_likelihoods.append(log_likelihood_predictive)
-            #     #print(f"Mean log-likelihood between predictive distribution and true model: {log_likelihood_predictive}")
+            # theta_mu = pyro.param("theta_mu").detach().data.clone()
+            # theta_sig = pyro.param("theta_sig").detach().data.clone()
 
-            #     logging.info("RMSE {} \n MMD {} \n Log Likelihood {}".format(
-            #         rmse_predictive, mmd_predictive, log_likelihood_predictive))
-            
-            #     results['rmse'], results['mmd'], results['log_likelihood'] = rmse_predictive, mmd_predictive, log_likelihood_predictive
-
-            # Create a dictionary mapping each design in ls to its predictive samples
-            #print(X, X.shape)
-            #print(predictive_samples.shape)
-            predictive_samples_dict = {}
-            for i in range(d_star_designs.shape[1]):
-                #print(d_star_designs[:, i, :, :])
-                samples = compute_predictive_distribution(model, d_star_designs[:, i, :, :], num_samples=1000).squeeze(-1).squeeze(-2).unsqueeze(-1)
-                l_flat = tuple(d_star_designs[:, i, :, :].flatten().tolist())
-                predictive_samples_dict[l_flat] = samples
-                print(f"Predictive samples for design {l_flat}: {predictive_samples_dict[l_flat].shape}")
-                print(l_flat, torch.mean(predictive_samples_dict[l_flat], dim=0), torch.var(predictive_samples_dict[l_flat], dim=0), torch.quantile(predictive_samples_dict[l_flat], q=0.5, dim=0, interpolation="midpoint"), iqr(predictive_samples_dict[l_flat], dim=0) ** 2)
-
-            #print(predictive_samples_dict.keys())
-
-            if inference == "bayesian":
-                elbo_loss = Trace_ELBO()
-                guide = lambda *args, **kwargs: elboguide(*args, k=k, d=d, **kwargs) # AutoDiagonalNormal(conditioned_model) not functioning properly
-            elif inference == "gibbs":
-                elbo_loss = generalised_elbo
-                guide = lambda *args, **kwargs: genelboguide(*args, k=k, d=d, **kwargs) # AutoDiagonalNormal(conditioned_model) not functioning properly
-            else:
-                raise ValueError(f"Unknown inference type: {inference}. Choose from 'bayesian' or 'gibbs'.")
-
-            conditioned_model = pyro.condition(model, {"y": ys})
-            svi = SVI(conditioned_model,
-                    guide,
-                    Adam({"lr": 0.005}),
-                    loss=elbo_loss)
-            num_iters = 10000
-            for i in range(num_iters):
-                svi.step(d_star_designs)
-
-            # guide_loc = guide.get_posterior().mean.detach().clone().reshape_as(theta_mu)
-            # guide_scale = guide.get_posterior().stddev.detach().clone().reshape_as(theta_sig) + 1e-3
-
-            # print(guide_loc.shape, guide_scale.shape, guide_loc, guide_scale)
-
-            # logging.info("guide_loc {} \n guide_scale {}".format(
-            #     guide_loc.squeeze(), guide_scale.squeeze()))
-            # results['guide_loc'], results['guide_scale'] = guide_loc, guide_scale
-
-            # model = make_location_model(guide_loc, guide_scale, alpha, b, m, observation_sd)
-
-            # elbo_learn(
-            #         prior, d_star_designs, ["y"], ["theta"], 10, 1000,
-            #         partial(elboguide, dim=num_parallel), {"y": ys}, optim.Adam({"lr": 0.005})
-            #     )
-            
-            theta_mu = pyro.param("theta_mu").detach().data.clone()
-            theta_sig = pyro.param("theta_sig").detach().data.clone()
+            posterior_samples = mcmc.get_samples()["theta"]
+            theta_mu = posterior_samples.mean(dim=0)
+            theta_sig = posterior_samples.std(dim=0).clamp(min=1e-6)
 
             logging.info("theta_mu {} \n theta_sig {}".format(
                 theta_mu.squeeze(), theta_sig.squeeze()))
@@ -689,27 +612,9 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
 
             history.append((theta_mu.detach().clone().cpu().numpy(), theta_sig.detach().clone().cpu().numpy()))
 
-            model = make_location_model(theta_mu, theta_sig, alpha, b, m, observation_sd)
-
-            # predictive_samples = compute_predictive_distribution(model, X.unsqueeze(2).unsqueeze(0), num_samples=1000).squeeze(-1).squeeze(-2).unsqueeze(-1)
-            # true_values = true_model(lexpand(X.unsqueeze(2).unsqueeze(0), predictive_samples.shape[0])).squeeze(-1).squeeze(-2).unsqueeze(-1)
-
-            # rmse_predictive = compute_rmse_predictive_vs_true(predictive_samples, true_values)
-            # rmses.append(rmse_predictive)
-            # #print(f"RMSE between predictive distribution and true model: {rmse_predictive}")
-
-            # mmd_predictive = compute_mmd_vectorized_per_dim(predictive_samples, true_values, bandwidths=median_heuristic_bandwidth_per_dim(predictive_samples, true_values))
-            # mmds.append(mmd_predictive)
-            # #print(f"MMD between predictive distribution and true model: {mmd_predictive}")
-
-            # log_likelihood_predictive = compute_mean_log_likelihood(true_values, model, X.unsqueeze(2), num_theta_samples=100)
-            # log_likelihoods.append(log_likelihood_predictive)
-            # #print(f"Mean log-likelihood between predictive distribution and true model: {log_likelihood_predictive}")
-            
-            # logging.info("RMSE {} \n MMD {} \n Log Likelihood {}".format(
-            #     rmse_predictive, mmd_predictive, log_likelihood_predictive))
-            
-            # results['rmse'], results['mmd'], results['log_likelihood'] = rmse_predictive, mmd_predictive, log_likelihood_predictive
+            empirical_prior = EmpiricalPrior(posterior_samples.squeeze().squeeze())
+            model = make_location_model(empirical_prior, alpha, b, m, observation_sd)
+            #model = make_location_model(theta_mu, theta_sig, alpha, b, m, observation_sd)
 
             # Final loop should output final results
             if (experiment + 1) == num_steps:
@@ -771,7 +676,7 @@ if __name__ == "__main__":
     parser.add_argument("--T", type=int, default=10, help="Number of experiments to run")
     #parser.add_argument("--num-parallel", nargs="?", default=1, type=int)
     parser.add_argument("--name", nargs="?", default="nmc", type=str)
-    parser.add_argument("--typs", nargs="?", default="nmc", type=str)
+    parser.add_argument("--typs", nargs="?", default="gibbs-nmc", type=str)
     parser.add_argument("--inference", nargs="?", default="bayesian", type=str)
     parser.add_argument("--lengthscale", nargs="?", default=15.0, type=float)
     parser.add_argument("--variance", nargs="?", default=4.0, type=float)
@@ -781,7 +686,7 @@ if __name__ == "__main__":
     parser.add_argument("--w", default=1.0, type=float, help="Learning rate for posterior")
     parser.add_argument("--N", type=int, default=10000, help="Number of samples for EIG estimation (N)")
     parser.add_argument("--M", type=int, default=100, help="Number of samples for EIG estimation (M)")
-    parser.add_argument("--chosen-loss", default="score-matching-weighted", type=str,
+    parser.add_argument("--chosen-loss", default="neg-log", type=str,
                         help="Choose from 'score-matching-weighted' or 'score-matching-default'.")
     parser.add_argument("--misspecification", default="none", type=str,
                         help="Choose from 'none', 'outlier', or 'error-dist'.")
@@ -797,4 +702,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
     main(args.T, 1, args.name, args.typs, args.inference, args.seed, args.lengthscale, args.variance, args.num_acquisition,
          args.observation_sd, args.w, args.N, args.M, args.chosen_loss, args.misspecification, args.actual_observation_sd, args.c_imq, args.b_use_expdecay, args.b_expdecay_imq, args.k, args.d, args.loglevel)
-
