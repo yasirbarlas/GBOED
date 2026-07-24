@@ -40,8 +40,6 @@ def gibbs_nmc_eig(
         observation_labels = [observation_labels]
     if isinstance(target_labels, str):
         target_labels = [target_labels]
-    #if isinstance(w, float):
-    #    w = [w]
 
     # Take N samples of the model
     expanded_design = lexpand(design, N)  # N copies of the model
@@ -58,7 +56,6 @@ def gibbs_nmc_eig(
     log_prob = sum(trace.nodes[l]["log_prob"] for l in observation_labels)
     
     # Compute the loss for each sample
-    #losses = torch.stack([-wi * loss_fn(expanded_design, y_value, theta_value) for wi in w]).mean(dim=0)
     losses = -w * loss_fn(expanded_design, y_value, theta_value)
 
     # Create importance weights, normalising numerator and denominator
