@@ -1,6 +1,6 @@
 # Generalised Bayesian Optimal Experimental Design (GBOED)
 
-Notes: This repository and its contents support the paper titled ['Robust Experimental Design via Generalised Bayesian Inference'](https://arxiv.org/abs/2511.07671). We recommend citing this paper if you plan on using the contents of this repository in any capacity for your own work/research. Where relevant, code was adapted and used from the following repositories [DAD](https://github.com/ae-foster/dad), [iDAD](https://github.com/desi-ivanova/idad), [RL-BOED](https://github.com/csiro-mlai/RL-BOED), and [RL-BOED](https://github.com/yasirbarlas/RL-BOED).
+Notes: This repository and its contents support the paper titled ['Robust Experimental Design via Generalised Bayesian Inference'](https://arxiv.org/abs/2511.07671). We recommend citing this paper if you plan on using the contents of this repository in any capacity for your own work/research. Where relevant, code was adapted and used from the following repositories [DAD](https://github.com/ae-foster/dad), [iDAD](https://github.com/desi-ivanova/idad), [RL-BOED](https://github.com/csiro-mlai/RL-BOED), [RL-BOED](https://github.com/yasirbarlas/RL-BOED), and [DFB](https://github.com/takuomatsubara/Discrete-Fisher-Bayes).
 
 ### Requirements
 - Python 3.9+ - we use Python 3.9.13
