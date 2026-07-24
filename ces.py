@@ -27,9 +27,9 @@ from pyro.infer.predictive import Predictive
 from pyro.contrib.util import lexpand
 from pyro import poutine
 
-from censored_sigmoid_normal import CensoredSigmoidNormal
-from gibbs_eig import gibbs_nmc_eig
-from loss_functions import score_matching_ces
+from utils.censored_sigmoid_normal import CensoredSigmoidNormal
+from utils.gibbs_eig import gibbs_nmc_eig
+from utils.loss_functions import score_matching_ces
 
 # Get device for PyTorch (GPU or CPU for training)
 #device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
