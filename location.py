@@ -32,8 +32,8 @@ from pyro.infer.autoguide import AutoDiagonalNormal
 from pyro.distributions.transforms import SplineAutoregressive, SplineCoupling, AffineAutoregressive, Permute
 from pyro.nn import AutoRegressiveNN, DenseNN
 
-from gibbs_eig import gibbs_nmc_eig
-from loss_functions import score_matching_location
+from utils.gibbs_eig import gibbs_nmc_eig
+from utils.loss_functions import score_matching_location
 
 # Get device for PyTorch (GPU or CPU for training)
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
