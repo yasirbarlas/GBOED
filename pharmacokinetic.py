@@ -28,8 +28,8 @@ from pyro.contrib.util import lexpand
 from pyro import poutine
 from pyro.infer.autoguide import AutoDiagonalNormal
 
-from utils.gibbs_eig import gibbs_nmc_eig
-from utils.loss_functions import score_matching_pharmacokinetic
+from gibbs_eig import gibbs_nmc_eig
+from loss_functions import score_matching_pharmacokinetic
 
 # Get device for PyTorch (GPU or CPU for training)
 #device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -345,7 +345,7 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
                 #print("normal_val", normal_val)
                 outlier_mask = dist.Bernoulli(torch.tensor(0.5)).sample(normal_val.shape)
                 #print("outlier_mask", outlier_mask)
-                outlier = dist.Uniform(3.0, 7.0).sample(normal_val.shape)
+                outlier = dist.Uniform(1.0, 4.0).sample(normal_val.shape)
                 #print("outlier", outlier)
                 normal_val += - (outlier_mask * outlier)
                 #print("modified normal_val", normal_val)
@@ -457,21 +457,22 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
             # Initialisation
             noise = torch.tensor(0.2).pow(2)
             # X = 100*rexpand(torch.rand((num_parallel, num_acq)), 4)
-            X = 24 * torch.rand((num_parallel, num_acquisition, 1, design_dim))
+            test_x = torch.linspace(*(0.0, 24.0), steps=num_acquisition, dtype=torch.float).unsqueeze(-1)
             # Ensures designs are the same (assuming seed is the same) no matter the loss function used for computing metrics (fairer comparison of results)
-            predictive_samples = compute_predictive_distribution(model, X, num_samples=1000).squeeze(-1).squeeze(-2).unsqueeze(-1)
-            true_values = true_model(lexpand(X, predictive_samples.shape[0])).squeeze(-1).squeeze(-2).unsqueeze(-1)
-            print(predictive_samples.shape, true_values.shape)
+            predictive_samples_testx = compute_predictive_distribution(model, test_x.unsqueeze(0).unsqueeze(-1), num_samples=1000).squeeze(1)
+            true_values = true_model(lexpand(test_x.unsqueeze(0).unsqueeze(-1), predictive_samples_testx.shape[0])).squeeze(1)
+            #true_values = true_model(lexpand(X, predictive_samples.shape[0])).squeeze(-1).squeeze(-2).unsqueeze(-1)
+            print(predictive_samples_testx.shape, true_values.shape)
 
-            rmse_predictive = compute_rmse_predictive_vs_true(predictive_samples, true_values)
+            rmse_predictive = compute_rmse_predictive_vs_true(predictive_samples_testx, true_values)
             rmses.append(rmse_predictive)
             #print(f"RMSE between predictive distribution and true model: {rmse_predictive}")
 
-            mmd_predictive = compute_mmd_vectorized_per_dim(predictive_samples, true_values, bandwidths=median_heuristic_bandwidth_per_dim(predictive_samples, true_values))
+            mmd_predictive = compute_mmd_vectorized_per_dim(predictive_samples_testx, true_values, bandwidths=median_heuristic_bandwidth_per_dim(predictive_samples_testx, true_values))
             mmds.append(mmd_predictive)
             #print(f"MMD between predictive distribution and true model: {mmd_predictive}")
 
-            log_likelihood_predictive = compute_mean_log_likelihood(true_values, model, X.squeeze(0), num_theta_samples=100)
+            log_likelihood_predictive = compute_mean_log_likelihood(true_values, model, test_x.unsqueeze(0).unsqueeze(-1).squeeze(0), num_theta_samples=100)
             log_likelihoods.append(log_likelihood_predictive)
             #print(f"Mean log-likelihood between predictive distribution and true model: {log_likelihood_predictive}")
 
@@ -479,6 +480,10 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
                 rmse_predictive, mmd_predictive, log_likelihood_predictive))
                 
             results['rmse'], results['mmd'], results['log_likelihood'] = rmse_predictive, mmd_predictive, log_likelihood_predictive
+
+            X = 24 * torch.rand((num_parallel, num_acquisition, 1, design_dim))
+            predictive_samples = compute_predictive_distribution(model, X, num_samples=1000).squeeze(-1).squeeze(-2).unsqueeze(-1)
+            print(predictive_samples.shape)
 
             if typ in ['nmc', 'gibbs-nmc']:
                 #print(X, X.shape)
@@ -576,49 +581,17 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
             logging.info('ys {} {}'.format(ys.squeeze(), ys.shape))
             results['y'] = y
 
-            # if experiment == 0:
-            #     print("Initial model statistics:")
-            #     predictive_samples = compute_predictive_distribution(model, X.unsqueeze(2).unsqueeze(0), num_samples=1000).squeeze(-1).squeeze(-2).unsqueeze(-1)
-            #     true_values = true_model(lexpand(X.unsqueeze(2).unsqueeze(0), predictive_samples.shape[0])).squeeze(-1).squeeze(-2).unsqueeze(-1)
-
-            #     rmse_predictive = compute_rmse_predictive_vs_true(predictive_samples, true_values)
-            #     rmses.append(rmse_predictive)
-            #     #print(f"RMSE between predictive distribution and true model: {rmse_predictive}")
-
-            #     mmd_predictive = compute_mmd_vectorized_per_dim(predictive_samples, true_values, bandwidths=median_heuristic_bandwidth_per_dim(predictive_samples, true_values))
-            #     mmds.append(mmd_predictive)
-            #     #print(f"MMD between predictive distribution and true model: {mmd_predictive}")
-
-            #     log_likelihood_predictive = compute_mean_log_likelihood(true_values, model, X.unsqueeze(2), num_theta_samples=100)
-            #     log_likelihoods.append(log_likelihood_predictive)
-            #     #print(f"Mean log-likelihood between predictive distribution and true model: {log_likelihood_predictive}")
-
-            #     logging.info("RMSE {} \n MMD {} \n Log Likelihood {}".format(
-            #         rmse_predictive, mmd_predictive, log_likelihood_predictive))
-            
-            #     results['rmse'], results['mmd'], results['log_likelihood'] = rmse_predictive, mmd_predictive, log_likelihood_predictive
-
             # Create a dictionary mapping each design in ls to its predictive samples
             #print(X, X.shape)
             #print(predictive_samples.shape)
             predictive_samples_dict = {}
             for i in range(d_star_designs.shape[2]):
-                #print(d_star_designs[:, :, i, :])
+                #print(d_star_designs[:, i, :, :])
                 samples = compute_predictive_distribution(model, d_star_designs[:, :, i, :], num_samples=1000).squeeze(-1).squeeze(-2).unsqueeze(-1)
                 l_flat = tuple(d_star_designs[:, :, i, :].flatten().tolist())
                 predictive_samples_dict[l_flat] = samples
                 print(f"Predictive samples for design {l_flat}: {predictive_samples_dict[l_flat].shape}")
                 print(l_flat, torch.mean(predictive_samples_dict[l_flat], dim=0), torch.var(predictive_samples_dict[l_flat], dim=0), torch.quantile(predictive_samples_dict[l_flat], q=0.5, dim=0, interpolation="midpoint"), iqr(predictive_samples_dict[l_flat], dim=0) ** 2)
-
-            # for l in d_star_designs:
-            #    idx = (X == l).all(dim=-1).nonzero(as_tuple=True)[1].item()
-            #    print(idx)
-            #    l_flat = tuple(l.flatten().tolist())
-            #    predictive_samples_dict[l_flat] = predictive_samples[:, idx, :].squeeze(-1)  # (num_samples, 1)
-            #    print(f"Predictive samples for design {l_flat}: {predictive_samples_dict[l_flat].shape}")
-            #    print(l_flat, torch.mean(predictive_samples_dict[l_flat], dim=0), torch.var(predictive_samples_dict[l_flat], dim=0), torch.quantile(predictive_samples_dict[l_flat], q=0.5, dim=0, interpolation="midpoint"), iqr(predictive_samples_dict[l_flat], dim=0) ** 2)
-
-            #print(predictive_samples_dict.keys())
 
             if inference == "bayesian":
                 elbo_loss = Trace_ELBO()
@@ -636,22 +609,6 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
             num_iters = 10000
             for i in range(num_iters):
                 svi.step(d_star_designs)
-
-            # guide_loc = guide.get_posterior().mean.detach().clone().reshape_as(theta_mu)
-            # guide_scale = guide.get_posterior().stddev.detach().clone().reshape_as(theta_sig) + 1e-3
-
-            # print(guide_loc.shape, guide_scale.shape, guide_loc, guide_scale)
-
-            # logging.info("guide_loc {} \n guide_scale {}".format(
-            #     guide_loc.squeeze(), guide_scale.squeeze()))
-            # results['guide_loc'], results['guide_scale'] = guide_loc, guide_scale
-
-            # model = make_pharmaco_model(theta_mu, theta_sig, D_v, epsilon_scale, nu_scale)
-
-            # elbo_learn(
-            #         prior, d_star_designs, ["y"], ["theta"], 10, 1000,
-            #         partial(elboguide, dim=num_parallel), {"y": ys}, optim.Adam({"lr": 0.005})
-            #     )
             
             theta_mu = pyro.param("theta_mu").detach().data.clone()
             theta_sig = pyro.param("theta_sig").detach().data.clone()
@@ -664,43 +621,25 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
 
             model = make_pharmaco_model(theta_mu, theta_sig, D_v, assumed_epsilon, assumed_nu)
 
-            # predictive_samples = compute_predictive_distribution(model, X.unsqueeze(2).unsqueeze(0), num_samples=1000).squeeze(-1).squeeze(-2).unsqueeze(-1)
-            # true_values = true_model(lexpand(X.unsqueeze(2).unsqueeze(0), predictive_samples.shape[0])).squeeze(-1).squeeze(-2).unsqueeze(-1)
-
-            # rmse_predictive = compute_rmse_predictive_vs_true(predictive_samples, true_values)
-            # rmses.append(rmse_predictive)
-            # #print(f"RMSE between predictive distribution and true model: {rmse_predictive}")
-
-            # mmd_predictive = compute_mmd_vectorized_per_dim(predictive_samples, true_values, bandwidths=median_heuristic_bandwidth_per_dim(predictive_samples, true_values))
-            # mmds.append(mmd_predictive)
-            # #print(f"MMD between predictive distribution and true model: {mmd_predictive}")
-
-            # log_likelihood_predictive = compute_mean_log_likelihood(true_values, model, X.unsqueeze(2), num_theta_samples=100)
-            # log_likelihoods.append(log_likelihood_predictive)
-            # #print(f"Mean log-likelihood between predictive distribution and true model: {log_likelihood_predictive}")
-            
-            # logging.info("RMSE {} \n MMD {} \n Log Likelihood {}".format(
-            #     rmse_predictive, mmd_predictive, log_likelihood_predictive))
-            
-            # results['rmse'], results['mmd'], results['log_likelihood'] = rmse_predictive, mmd_predictive, log_likelihood_predictive
-
             # Final loop should output final results
             if (experiment + 1) == num_steps:
                 X = 24 * torch.rand((num_parallel, num_acquisition, 1, design_dim))
 
                 # Ensures designs are the same (assuming seed is the same) no matter the loss function used for computing metrics (fairer comparison of results)
-                predictive_samples = compute_predictive_distribution(model, X, num_samples=1000).squeeze(-1).squeeze(-2).unsqueeze(-1)
-                true_values = true_model(lexpand(X, predictive_samples.shape[0])).squeeze(-1).squeeze(-2).unsqueeze(-1)
+                predictive_samples_testx = compute_predictive_distribution(model, test_x.unsqueeze(0).unsqueeze(-1), num_samples=1000).squeeze(1)
+                true_values = true_model(lexpand(test_x.unsqueeze(0).unsqueeze(-1), predictive_samples_testx.shape[0])).squeeze(1)
+                #predictive_samples = compute_predictive_distribution(model, X, num_samples=1000).squeeze(-1).squeeze(-2).unsqueeze(-1)
+                #true_values = true_model(lexpand(X, predictive_samples.shape[0])).squeeze(-1).squeeze(-2).unsqueeze(-1)
 
-                rmse_predictive = compute_rmse_predictive_vs_true(predictive_samples, true_values)
+                rmse_predictive = compute_rmse_predictive_vs_true(predictive_samples_testx, true_values)
                 rmses.append(rmse_predictive)
                 #print(f"RMSE between predictive distribution and true model: {rmse_predictive}")
 
-                mmd_predictive = compute_mmd_vectorized_per_dim(predictive_samples, true_values, bandwidths=median_heuristic_bandwidth_per_dim(predictive_samples, true_values))
+                mmd_predictive = compute_mmd_vectorized_per_dim(predictive_samples_testx, true_values, bandwidths=median_heuristic_bandwidth_per_dim(predictive_samples_testx, true_values))
                 mmds.append(mmd_predictive)
                 #print(f"MMD between predictive distribution and true model: {mmd_predictive}")
 
-                log_likelihood_predictive = compute_mean_log_likelihood(true_values, model, X.squeeze(0), num_theta_samples=100)
+                log_likelihood_predictive = compute_mean_log_likelihood(true_values, model, test_x.unsqueeze(0).unsqueeze(-1).squeeze(0), num_theta_samples=100)
                 log_likelihoods.append(log_likelihood_predictive)
                 #print(f"Mean log-likelihood between predictive distribution and true model: {log_likelihood_predictive}")
 
@@ -770,4 +709,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
     main(args.T, 1, args.name, args.typs, args.inference, args.seed, args.lengthscale, args.variance, args.num_acquisition,
          args.assumed_epsilon_scale, args.assumed_nu_scale, args.w, args.N, args.M, args.chosen_loss, args.misspecification, args.actual_epsilon_scale, args.actual_nu_scale, args.c_imq, args.b_use_expdecay, args.b_expdecay_imq, args.loglevel)
-
