@@ -28,8 +28,8 @@ from pyro.contrib.util import lexpand
 from pyro import poutine
 from pyro.infer.autoguide import AutoDiagonalNormal
 
-from gibbs_eig import gibbs_nmc_eig
-from loss_functions import score_matching_pharmacokinetic
+from utils.gibbs_eig import gibbs_nmc_eig
+from utils.loss_functions import score_matching_pharmacokinetic
 
 # Get device for PyTorch (GPU or CPU for training)
 #device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
