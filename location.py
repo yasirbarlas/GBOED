@@ -410,11 +410,9 @@ def main(num_steps, num_parallel, experiment_name, typs, inference, seed, length
 
                 x_data = args[0]
                 y_data = model_trace.nodes["y"]["value"]
-
-                predictive = pred_elbo_samples #predictive_samples_tensor[indices].squeeze(-1).permute(0, 2, 1, 3).squeeze(0)
                 y_batch = y_data.unsqueeze(-1)
 
-                loss_terms = gen_loss_fn(x_data, y_batch, theta, model, predictive=predictive, tau=tau, c_squared=c_squared)
+                loss_terms = gen_loss_fn(x_data, y_batch, theta, model, predictive=pred_elbo_samples, tau=tau, c_squared=c_squared)
                 loss_sum = -w * loss_terms.sum()
 
                 # Compute the log probabilities of the model and guide, using loss_sum to replace the log likelihood
