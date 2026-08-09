@@ -137,35 +137,6 @@ def median_heuristic_bandwidth_per_dim(x, y):
     sigma = torch.sqrt(h_n / 2)
     return sigma
 
-def median_heuristic_bandwidth_per_dim(x, y):
-    """
-    Compute median heuristic bandwidth per dimension (D,) from combined samples x and y.
-
-    Args:
-        x, y: Tensors of shape (N, D, 1)
-
-    Returns:
-        Tensor of shape (D,) with one bandwidth per dimension
-    """
-    x = x.squeeze(-1).to(torch.float32)  # (N, D)
-    y = y.squeeze(-1).to(torch.float32)
-
-    xy = torch.cat([x, y], dim=0)  # (2N, D)
-    n = xy.shape[0]
-
-    # Get all pairwise differences: (2N, 2N, D)
-    diffs = xy.unsqueeze(0) - xy.unsqueeze(1)  # (2N, 2N, D)
-    dists_sq = (diffs ** 2)  # (2N, 2N, D)
-
-    # Extract upper triangle indices excluding diagonal
-    i, j = torch.triu_indices(n, n, offset=1)
-    upper_dists_sq = dists_sq[i, j, :]  # (num_pairs, D)
-
-    # Median across pairs for each dimension → shape (D,)
-    h_n = upper_dists_sq.median(dim=0).values
-    sigma = torch.sqrt(h_n / 2)
-    return sigma
-
 def compute_mmd_vectorized_per_dim(x, y, bandwidths):
     """
     Compute MMD per dimension across 100 dimensions and average.
